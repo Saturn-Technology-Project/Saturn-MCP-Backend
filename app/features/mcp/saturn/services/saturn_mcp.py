@@ -4,38 +4,24 @@ import hashlib
 from typing import Any
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, text, update
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from sqlalchemy.orm.attributes import set_committed_value
 
 from app.core.ids import new_id, utcnow
 from app.models import Action, Agent, Approval, Run, Tool, ToolSet, ToolSetItem, User
-from app.core.enums import ActionStatus, ActorType, ApprovalStatus, AuditEvent, PolicyDecision, RunStatus
+from app.core.enums import ActionStatus, ActorType, ApprovalStatus, AuditEvent, ExecutionState, PolicyDecision, RunStatus
 from app.features.execution.activity.services.audit_service import audit_service
 from app.features.execution.activity.services.zero_access import PAYLOAD_ENCRYPTION, action_digest, is_zero_access
 from app.features.execution.activity.services.content_seal import policy_fields
-from app.features.execution.approvals.services.approval_arguments import digest_matches, open_result, seal_result, server_sealed
+from app.features.execution.approvals.services.approval_arguments import digest_matches, open_result, server_sealed
 from app.features.mcp.saturn.services.mcp_sessions import mcp_sessions
-from app.features.mcp.servers.services.mcp_remote import call_remote_tool
+from app.features.mcp.servers.services.mcp_remote import call_remote_tool, split_reply
 from app.features.policy.policies.services.policy_engine import policy_engine
 
 
 def rpc_result(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "result": result}
-
-
-def _split_remote(body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Real MCP replies are a JSON-RPC envelope. Test doubles return the tool result itself."""
-    if "result" in body and ("jsonrpc" in body or "id" in body):
-        result = body.get("result")
-        tool = result if isinstance(result, dict) else ({"value": result} if result is not None else {})
-        return body, tool
-    return body, body
-
-
-def _status_text(value: Any) -> str:
-    return value.value if hasattr(value, "value") else str(value or "")
 
 
 SATURN_RUN_ARGUMENT = "saturnRunId"
@@ -175,6 +161,15 @@ MAX_AGENTS_PER_USER = 25
 
 
 MAX_PENDING_APPROVALS_PER_AGENT = 100
+
+# A person or a rule closed the request. Expiry has its own message.
+_CLOSED_BY_DECISION = frozenset({ApprovalStatus.REJECTED, ApprovalStatus.CANCELLED, ApprovalStatus.INVALIDATED})
+# What a second sender of an approved call is told once the first has started it.
+_STARTED_REPLY = {
+    ExecutionState.CLAIMED: "execution_in_progress",
+    ExecutionState.UNCERTAIN: "execution_uncertain",
+    ExecutionState.FAILED: "execution_failed",
+}
 LAST_SEEN_EVERY_SECONDS = 30
 
 class SaturnMcp:
@@ -650,9 +645,9 @@ class SaturnMcp:
         except Exception as exc:
             # The request record is already committed. Say how the call ended, so an attempt
             # that reached the upstream does not look like one that is still running.
-            from app.features.execution.approvals.services.approval_service import _uncertain
+            from app.features.execution.approvals.services.claimed_call import is_uncertain
 
-            outcome = "uncertain" if _uncertain(exc) else "failed"
+            outcome = "uncertain" if is_uncertain(exc) else "failed"
             detail = exc.detail if isinstance(exc, HTTPException) and isinstance(exc.detail, str) else type(exc).__name__
             await self._audit(
                 session,
@@ -666,7 +661,7 @@ class SaturnMcp:
             )
             await session.commit()
             raise
-        raw_response, result = _split_remote(raw_response)
+        raw_response, result = split_reply(raw_response)
         reply = rpc_result(request_id, result)
         # saturnRunId is the only caller-supplied run id. Link the audit row when that run belongs to this agent.
         run = await session.get(Run, run_id) if run_id else None
@@ -704,96 +699,144 @@ class SaturnMcp:
         audit_no: int,
         decision=None,
     ) -> dict[str, Any]:
-        from app.features.execution.approvals.services.approval_service import approval_service
-
+        """A call that needs approval: answer for the request it belongs to, or open a new one."""
         action = await session.get(Action, action_id) if action_id else None
-        if action is not None:
-            approval = await session.scalar(select(Approval).where(Approval.action_id == action.id))
-            if approval is not None:
-                from app.features.execution.approvals.services.expiration import expire_if_due
-
-                phase = await expire_if_due(session, approval, utcnow())
-                if phase:
-                    return _approval_expired(request_id, approval, phase, tool.name)
-            if approval is not None and approval.status == ApprovalStatus.APPROVED.value:
-                if not _same_arguments(agent.organization_id, action, approval, arguments):
-                    from app.features.mcp.saturn.services.agent_messages import mismatch_error
-
-                    return mismatch_error(request_id, policy_id=getattr(decision, "policy_id", None))
-                if approval.execution_state == "executed":
-                    cached = open_result(agent.organization_id, action.result)
-                    if cached is None and action.result is not None:
-                        # It ran, but what it returned can no longer be opened. Do not answer with an empty success.
-                        return rpc_error(request_id, -32005, "execution_recorded: this call already ran and its result is no longer available")
-                    return rpc_result(request_id, cached or {})
-                if approval.execution_state == "uncertain":
-                    return rpc_error(request_id, -32005, "execution_uncertain")
-                if approval.execution_state == "failed":
-                    return rpc_error(request_id, -32005, "execution_failed")
-                if approval.execution_state == "claimed":
-                    return rpc_error(request_id, -32005, "execution_in_progress")
-                return await self._execute_approved(
-                    session, agent, tool, request_id, action, approval, arguments=arguments, audit_no=audit_no
-                )
-            if approval is not None and approval.status == ApprovalStatus.PENDING.value:
-                if approval.parameter_digest and not digest_matches(agent.organization_id, approval.parameter_digest, arguments):
-                    approval.status = ApprovalStatus.INVALIDATED.value
-                    action.status = ActionStatus.DENIED.value
-                    from app.features.mcp.saturn.services.agent_messages import mismatch_error
-
-                    return mismatch_error(request_id, policy_id=getattr(decision, "policy_id", None))
-                return _approval_notice(
-                    request_id,
-                    -32001,
-                    _approval_required_message(tool.name, action.run_id),
-                    approval,
-                    tool.name,
-                    status="pending",
-                    policy_id=getattr(decision, "policy_id", None),
-                )
-            if approval is not None and _status_text(approval.status) == ApprovalStatus.EXPIRED.value:
-                return _approval_expired(request_id, approval, approval.expired_phase or "pending", tool.name)
-            if approval is not None and approval.status in {
-                ApprovalStatus.REJECTED.value,
-                ApprovalStatus.CANCELLED.value,
-                ApprovalStatus.INVALIDATED.value,
-            }:
-                closed = _status_text(approval.status)
-                text = (
-                    _approval_rejected_message(approval.run_id)
-                    if closed == ApprovalStatus.REJECTED.value
-                    else f"approval_{closed}. saturnRunId \"{approval.run_id}\" is closed. Leave saturnRunId out to start a separate request."
-                )
-                return _approval_notice(
-                    request_id,
-                    -32002,
-                    text,
-                    approval,
-                    tool.name,
-                    status=closed,
-                )
-
         if not action_id and run_id:
-            owned = await session.get(Run, run_id)
-            if owned is not None and owned.organization_id == agent.organization_id and owned.agent_id == agent.id:
-                action = await session.scalar(
-                    select(Action)
-                    .where(Action.run_id == owned.id, Action.tool == tool.name)
-                    .order_by(Action.created_at.desc())
-                )
-                if action is not None:
-                    return await self._approval_call(
-                        session,
-                        user,
-                        agent,
-                        tool,
-                        request_id,
-                        arguments=arguments,
-                        run_id=run_id,
-                        action_id=action.id,
-                        audit_no=audit_no,
-                        decision=decision,
-                    )
+            action = await self._latest_action(session, agent, tool, run_id)
+        if action is not None:
+            reply = await self._answer_for_request(
+                session, agent, tool, request_id, action, arguments=arguments, audit_no=audit_no, decision=decision
+            )
+            if reply is not None:
+                return reply
+        return await self._open_request(
+            session, user, agent, tool, request_id, action, arguments=arguments, run_id=run_id, audit_no=audit_no, decision=decision
+        )
+
+    async def _latest_action(self, session: AsyncSession, agent: Agent, tool: Tool, run_id: str) -> Action | None:
+        """The call this agent last made with this tool in a run it owns."""
+        owned = await session.get(Run, run_id)
+        if owned is None or owned.organization_id != agent.organization_id or owned.agent_id != agent.id:
+            return None
+        return await session.scalar(
+            select(Action).where(Action.run_id == owned.id, Action.tool == tool.name).order_by(Action.created_at.desc())
+        )
+
+    async def _answer_for_request(
+        self,
+        session: AsyncSession,
+        agent: Agent,
+        tool: Tool,
+        request_id: Any,
+        action: Action,
+        *,
+        arguments: dict[str, Any],
+        audit_no: int,
+        decision=None,
+    ) -> dict[str, Any] | None:
+        """What the agent is told about the approval this call already has. None: it has none to answer for."""
+        from app.features.execution.approvals.services.expiration import expire_if_due
+
+        approval = await session.scalar(select(Approval).where(Approval.action_id == action.id))
+        if approval is None:
+            return None
+        phase = await expire_if_due(session, approval, utcnow())
+        if phase:
+            return _approval_expired(request_id, approval, phase, tool.name)
+        policy_id = getattr(decision, "policy_id", None)
+        if approval.state is ApprovalStatus.APPROVED:
+            return await self._answer_approved(
+                session, agent, tool, request_id, action, approval, arguments=arguments, audit_no=audit_no, policy_id=policy_id
+            )
+        if approval.is_pending:
+            return await self._answer_pending(session, agent, tool, request_id, action, approval, arguments, policy_id)
+        if approval.state in _CLOSED_BY_DECISION:
+            closed = approval.state.value
+            text = (
+                _approval_rejected_message(approval.run_id)
+                if approval.state is ApprovalStatus.REJECTED
+                else f"approval_{closed}. saturnRunId \"{approval.run_id}\" is closed. Leave saturnRunId out to start a separate request."
+            )
+            return _approval_notice(request_id, -32002, text, approval, tool.name, status=closed)
+        return None
+
+    async def _answer_approved(
+        self,
+        session: AsyncSession,
+        agent: Agent,
+        tool: Tool,
+        request_id: Any,
+        action: Action,
+        approval: Approval,
+        *,
+        arguments: dict[str, Any],
+        audit_no: int,
+        policy_id: str | None,
+    ) -> dict[str, Any]:
+        """Approved: run it once. A call that already started is answered from what was recorded."""
+        if not _same_arguments(agent.organization_id, action, approval, arguments):
+            from app.features.mcp.saturn.services.agent_messages import mismatch_error
+
+            return mismatch_error(request_id, policy_id=policy_id)
+        if approval.execution is ExecutionState.NONE:
+            return await self._execute_approved(
+                session, agent, tool, request_id, action, approval, arguments=arguments, audit_no=audit_no
+            )
+        if approval.execution is ExecutionState.EXECUTED:
+            cached = open_result(agent.organization_id, action.result)
+            if cached is None and action.result is not None:
+                # It ran, but what it returned can no longer be opened. Do not answer with an empty success.
+                return rpc_error(request_id, -32005, "execution_recorded: this call already ran and its result is no longer available")
+            return rpc_result(request_id, cached or {})
+        return rpc_error(request_id, -32005, _STARTED_REPLY[approval.execution])
+
+    async def _answer_pending(
+        self,
+        session: AsyncSession,
+        agent: Agent,
+        tool: Tool,
+        request_id: Any,
+        action: Action,
+        approval: Approval,
+        arguments: dict[str, Any],
+        policy_id: str | None,
+    ) -> dict[str, Any]:
+        """Still waiting for people. Sending different arguments under the same run closes the request."""
+        from app.features.execution.approvals.models.transitions import INVALIDATE
+        from app.features.execution.approvals.services.lifecycle import approval_lifecycle
+
+        if approval.parameter_digest and not digest_matches(agent.organization_id, approval.parameter_digest, arguments):
+            if await approval_lifecycle.move(session, approval, INVALIDATE[ApprovalStatus.PENDING], now=utcnow()):
+                action.status = ActionStatus.DENIED.value
+            from app.features.mcp.saturn.services.agent_messages import mismatch_error
+
+            return mismatch_error(request_id, policy_id=policy_id)
+        return _approval_notice(
+            request_id,
+            -32001,
+            _approval_required_message(tool.name, action.run_id),
+            approval,
+            tool.name,
+            status="pending",
+            policy_id=policy_id,
+        )
+
+    async def _open_request(
+        self,
+        session: AsyncSession,
+        user: User,
+        agent: Agent,
+        tool: Tool,
+        request_id: Any,
+        action: Action | None,
+        *,
+        arguments: dict[str, Any],
+        run_id: str,
+        audit_no: int,
+        decision=None,
+    ) -> dict[str, Any]:
+        """Hold the call and ask people to approve it."""
+        from app.features.execution.approvals.services.approval_service import approval_service
 
         if action is None and await self._pending_for(session, agent) >= MAX_PENDING_APPROVALS_PER_AGENT:
             # Each held call stores a run, an action, an approval and audit rows. An agent that keeps
@@ -911,12 +954,10 @@ class SaturnMcp:
         arguments: dict[str, Any],
         audit_no: int,
     ) -> dict[str, Any]:
-        from app.features.execution.approvals.services.approval_service import (
-            _uncertain,
-            approval_service,
-            record_unrecorded_outcome,
-            settle_claim,
-        )
+        from app.features.execution.approvals.models.transitions import CLAIM, INVALIDATE
+        from app.features.execution.approvals.services.approval_service import approval_service
+        from app.features.execution.approvals.services.claimed_call import ClaimedCall, Executed, OutcomeUncertain
+        from app.features.execution.approvals.services.lifecycle import approval_lifecycle
 
         run = await session.get(Run, action.run_id)
         fresh = await policy_engine.evaluate_named(
@@ -928,17 +969,7 @@ class SaturnMcp:
         )
         if fresh.decision == PolicyDecision.DENY:
             # Close the approval before anything is claimed, so it cannot stay claimed forever.
-            closed = await session.execute(
-                update(Approval)
-                .where(
-                    Approval.id == approval.id,
-                    Approval.status == ApprovalStatus.APPROVED.value,
-                    Approval.execution_state == "none",
-                )
-                .values(status=ApprovalStatus.INVALIDATED.value)
-            )
-            if closed.rowcount == 1:
-                set_committed_value(approval, "status", ApprovalStatus.INVALIDATED.value)
+            if await approval_lifecycle.move(session, approval, INVALIDATE[ApprovalStatus.APPROVED]):
                 action.status = ActionStatus.DENIED.value
                 if run is not None:
                     run.status = RunStatus.FAILED.value
@@ -972,49 +1003,14 @@ class SaturnMcp:
                 tool.name,
                 status=ApprovalStatus.INVALIDATED.value,
             )
-        claimed = await session.execute(
-            update(Approval)
-            .where(
-                Approval.id == approval.id,
-                Approval.status == ApprovalStatus.APPROVED.value,
-                Approval.execution_state == "none",
-            )
-            .values(execution_state="claimed")
-        )
-        if claimed.rowcount != 1:
-            await session.refresh(approval)
-            if _status_text(approval.status) == ApprovalStatus.EXPIRED.value:
+        if not await approval_lifecycle.move(session, approval, CLAIM):
+            if approval.is_expired:
                 return _approval_expired(request_id, approval, approval.expired_phase or "resubmit", tool.name)
             return rpc_error(request_id, -32005, "execution_in_progress")
-        set_committed_value(approval, "execution_state", "claimed")
         # The claim must survive anything that fails after the upstream call.
         await session.commit()
-        try:
-            raw_response = await self._proxy(session, tool, arguments)
-        except Exception as exc:
-            if _uncertain(exc):
-                await settle_claim(session, approval, "uncertain")
-                if run is not None:
-                    from app.features.identity.auth.services.notices import notify_task_outcome
 
-                    await notify_task_outcome(session, run, "failed")
-                return rpc_error(request_id, -32005, "execution_uncertain")
-            action.status = ActionStatus.FAILED.value
-            if run is not None:
-                run.status = RunStatus.FAILED.value
-                run.updated_at = utcnow()
-            await settle_claim(session, approval, "failed")
-            raise
-        approval_id = approval.id
-        try:
-            raw_response, result = _split_remote(raw_response)
-            reply = rpc_result(request_id, result)
-            action.status = ActionStatus.COMPLETED.value
-            action.result = seal_result(agent.organization_id, result)
-            if run is not None:
-                run.status = RunStatus.COMPLETED.value
-                run.updated_at = utcnow()
-            await settle_claim(session, approval, "executed", commit=False)
+        async def audit(executed: Executed) -> None:
             await self._audit(
                 session,
                 event=AuditEvent.TOOL_EXECUTED,
@@ -1030,16 +1026,17 @@ class SaturnMcp:
                     "server_name": tool.mcp_server.name if tool.mcp_server is not None else "",
                     "arguments": arguments,
                     "approval_id": approval.id,
-                    "raw_response": raw_response,
-                    "server_result": result,
-                    },
+                    "raw_response": executed.raw,
+                    "server_result": executed.result,
+                },
             )
-            await session.commit()
-        except Exception:
-            # The upstream already ran. Keep the claim and say the outcome is uncertain instead of a 500.
-            await record_unrecorded_outcome(session, approval_id)
+
+        call = ClaimedCall(session, approval, action, run, organization_id=agent.organization_id)
+        try:
+            executed = await call.run(lambda: self._proxy(session, tool, arguments), audit)
+        except OutcomeUncertain:
             return rpc_error(request_id, -32005, "execution_uncertain")
-        return reply
+        return rpc_result(request_id, executed.result)
 
     async def _proxy(self, session: AsyncSession, tool: Tool, arguments: dict[str, Any]) -> dict[str, Any]:
         from app.features.mcp.oauth.services.mcp_oauth import mcp_oauth
@@ -1057,7 +1054,7 @@ class SaturnMcp:
         try:
             return await call_remote_tool(endpoint, upstream, arguments, secret)
         except McpUnauthorized:
-            secret = await mcp_oauth.refresh_after_reject(session, server)
+            secret = await mcp_oauth.refresh_after_reject(session, server, secret)
             if not secret:
                 raise HTTPException(status.HTTP_502_BAD_GATEWAY, "MCP server returned HTTP 401") from None
             await session.commit()

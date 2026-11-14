@@ -1,11 +1,11 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.core.config import get_settings
@@ -13,8 +13,11 @@ from app.core.body_limit import BodyLimitMiddleware
 from app.core.http_security import HttpSecurityMiddleware
 from app.core.logs import RequestLogMiddleware, configure_logging
 from app.core.origin_auth import OriginAuthMiddleware
+from app.core import status as service_status
+from app.features.identity.auth.controllers.deps import SessionDep
 from app.features.agent.agents.routes import router as agents_router
 from app.features.billing.payments.routes import router as payments_router
+from app.features.credentials.vault.services.pq_crypto import KeyUnavailable
 from app.features.credentials.vault.routes import router as credentials_router
 from app.features.execution.activity.routes import router as activity_router
 from app.features.execution.activity.controllers.payload_keys import router as payload_keys_router
@@ -38,6 +41,7 @@ from app.models import *  # noqa: F401,F403
 
 settings = get_settings()
 configure_logging()
+_logger = logging.getLogger(__name__)
 
 
 def _cors_origins() -> list[str]:
@@ -57,6 +61,18 @@ def _sqlite() -> bool:
     return settings.database_url.startswith("sqlite")
 
 
+async def _report_agents_without_policy() -> None:
+    from app.features.policy.policies.services.default_policy import log_agents_without_policy
+
+    try:
+        async with SessionLocal() as session:
+            await log_agents_without_policy(session)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        _logger.exception("could not list agents without a policy")
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     from app.features.credentials.vault.services.pq_crypto import require_root
@@ -65,7 +81,7 @@ async def lifespan(_app: FastAPI):
     from app.features.mcp.saturn.services.mcp_sessions import mcp_sessions
 
     await mcp_sessions.start()
-    worker = None
+    worker = report = sampler = None
     try:
         if not settings.skip_db_bootstrap:
             # Postgres schema is owned by Alembic (`alembic upgrade head` in Docker).
@@ -80,21 +96,25 @@ async def lifespan(_app: FastAPI):
 
                 await purge_expired(session)
                 await seed_if_empty(session)
-                from app.features.policy.policies.services.default_policy import log_agents_without_policy
-
-                await log_agents_without_policy(session)
                 await session.commit()
+            # A log line only. It runs beside the first requests instead of holding up the start.
+            report = asyncio.create_task(_report_agents_without_policy())
         if settings.saturn_embed_worker and not settings.skip_db_bootstrap:
-            from app.features.webhooks.services.worker import run_webhook_worker
+            from app.features.webhooks.services.worker import run_status_sampler, run_webhook_worker
 
             worker = asyncio.create_task(run_webhook_worker())
+            sampler = asyncio.create_task(run_status_sampler())
         yield
     finally:
-        if worker is not None:
-            worker.cancel()
-            with suppress(asyncio.CancelledError):
-                await worker
+        for task in (worker, report, sampler):
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
         await mcp_sessions.stop()
+        from app.features.mcp.servers.services.mcp_remote import close_clients
+
+        await close_clients()
         await engine.dispose()
 
 
@@ -121,6 +141,16 @@ app.add_middleware(OriginAuthMiddleware)
 # Added last, so it is the outermost layer: every request gets an id and a log line,
 # including the ones the origin check refuses.
 app.add_middleware(RequestLogMiddleware)
+
+
+@app.exception_handler(KeyUnavailable)
+async def key_unavailable(_request: Request, _exc: KeyUnavailable):
+    # An outage of the key service, not a fault in the stored secret: the same request works later.
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "Temporarily unavailable. Try again shortly."},
+        headers={"Retry-After": "30"},
+    )
 
 
 @app.exception_handler(Exception)
@@ -158,29 +188,29 @@ async def root():
     return {"status": "ok"}
 
 
-@app.get("/healthz")
-async def healthz():
-    # Open to the internet for probes, so it says only up or down.
-    report = await health()
-    if report["status"] != "ok":
-        return JSONResponse(status_code=503, content={"status": "error"})
+@app.get("/health")
+@app.get("/healthz", include_in_schema=False)
+async def health():
+    """Whether this process is serving requests. Nothing else is checked, by design.
+
+    Load balancers and uptime monitors call this, without the origin secret. Looking at the
+    database here would report an outage of the database as an outage of the API, and a
+    platform that restarts unhealthy instances would restart them for it. GET /status is where
+    dependencies are reported.
+
+    /healthz is the older name. Cloud Run keeps some paths ending in "z" for itself and never
+    passes that one on, so it only ever worked locally.
+    """
     return {"status": "ok"}
 
 
-@app.get("/health")
-async def health():
-    db_status = "down"
-    try:
-        async with engine.connect() as connection:
-            await connection.execute(text("SELECT 1"))
-        db_status = "operational"
-    except Exception:
-        db_status = "down"
-    ok = db_status == "operational"
-    return {
-        "status": "ok" if ok else "error",
-        "services": [
-            {"id": "api", "name": "API", "status": "operational"},
-            {"id": "database", "name": "Database", "status": db_status},
-        ],
-    }
+@app.get("/status")
+async def status():
+    """Which parts of the service are working. Always 200: the answer is in the body."""
+    return await service_status.report()
+
+
+@app.get("/status/history")
+async def status_history(session: SessionDep, days: int = Query(service_status.HISTORY_DAYS, ge=1, le=service_status.HISTORY_DAYS)):
+    """Uptime per service and day, from the samples the worker takes every minute."""
+    return await service_status.history(session, days)

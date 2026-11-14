@@ -12,24 +12,35 @@ router = APIRouter(prefix="/org/payload-keys", tags=["payload-keys"])
 _SECRET_FIELDS = {"recovery_key", "private_key", "dek", "org_private_key", "member_private_key", "password"}
 
 
+# Upper bounds for what a client may send. Each is several times the largest real value (an
+# ML-KEM-1024 public key is 3,136 hex characters, a wrapped private key under 10,000), so they
+# never refuse a real key; before, only the 4 MiB request limit applied to each field.
+_ID = 64
+_NAME = 64
+_SALT = 128  # the column size
+_NONCE = 64  # the column size
+_PUBLIC_KEY = 16_384
+_BLOB = 65_536
+
+
 class BackupBody(BaseModel):
     """Recovery backup. v2 is PBKDF2-HMAC-SHA256 with `iterations`; v1 (HKDF-SHA256) is legacy."""
 
     model_config = ConfigDict(extra="forbid")
 
     v: int
-    kdf: str
+    kdf: str = Field(max_length=_NAME)
     iterations: int | None = None
-    salt: str
-    nonce: str
-    ciphertext: str
+    salt: str = Field(max_length=_SALT)
+    nonce: str = Field(max_length=_NONCE)
+    ciphertext: str = Field(max_length=_BLOB)
     org_key_version: int
 
 
 class CreateOrgKeyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    public_key: str
+    public_key: str = Field(max_length=_PUBLIC_KEY)
     backup: BackupBody
 
 
@@ -43,19 +54,19 @@ class PasswordBackupBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     v: int
-    kdf: str
+    kdf: str = Field(max_length=_NAME)
     iterations: int | None = None
-    salt: str | None = None
-    nonce: str | None = None
-    ciphertext: str | None = None
-    scheme: str | None = None
-    blob: str | None = None
+    salt: str | None = Field(default=None, max_length=_SALT)
+    nonce: str | None = Field(default=None, max_length=_NONCE)
+    ciphertext: str | None = Field(default=None, max_length=_BLOB)
+    scheme: str | None = Field(default=None, max_length=_NAME)
+    blob: str | None = Field(default=None, max_length=_BLOB)
 
 
 class MemberKeyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    public_key: str
+    public_key: str = Field(max_length=_PUBLIC_KEY)
     backup: PasswordBackupBody | None = None
     needs_assist: bool = False
 
@@ -63,16 +74,16 @@ class MemberKeyBody(BaseModel):
 class EnvelopeBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_id: str
-    member_key_id: str
+    user_id: str = Field(max_length=_ID)
+    member_key_id: str = Field(max_length=_ID)
     org_key_version: int
-    wrapped_private_key: str
+    wrapped_private_key: str = Field(max_length=_BLOB)
 
 
 class RotateStartBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    public_key: str
+    public_key: str = Field(max_length=_PUBLIC_KEY)
 
 
 class RewrapItem(BaseModel):
@@ -83,11 +94,11 @@ class RewrapItem(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str
-    type: str
-    wrapped_dek: str
-    content_sha256: str | None = None
-    dek_proof: str | None = None
+    id: str = Field(max_length=_ID)
+    type: str = Field(max_length=_NAME)
+    wrapped_dek: str = Field(max_length=_BLOB)
+    content_sha256: str | None = Field(default=None, max_length=_NAME)
+    dek_proof: str | None = Field(default=None, max_length=_NAME * 4)
 
 
 class RewrapBody(BaseModel):
@@ -106,7 +117,7 @@ class ActivateBody(BaseModel):
 class TransferBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    user_id: str
+    user_id: str = Field(max_length=_ID)
 
 
 def _no_secrets(body: BaseModel) -> None:
@@ -299,7 +310,7 @@ async def member_rewrap_sources(
 class MemberRewrapBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    member_key_id: str
+    member_key_id: str = Field(max_length=_ID)
     records: list[RewrapItem] = Field(max_length=keys.SCAN_MAX_LIMIT)
 
 

@@ -54,6 +54,9 @@ _BLOCKED_V4 = (
     ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("198.18.0.0/15"),
     ipaddress.ip_network("240.0.0.0/4"),
+    # Azure's wire server: a public-looking address that answers only from inside a VM, like the
+    # link-local metadata address.
+    ipaddress.ip_network("168.63.129.16/32"),
 )
 
 
@@ -91,6 +94,8 @@ def address_blocked(value: str) -> bool:
         or address.is_multicast
         or address.is_reserved
         or address.is_unspecified
+        # fec0::/10, the retired site-local range. Not in is_private, still routed inside some networks.
+        or (address.version == 6 and address.is_site_local)
     ):
         return True
     return address.version == 4 and any(address in network for network in _BLOCKED_V4)
@@ -141,8 +146,32 @@ _CREDENTIAL_PARAMS = frozenset(
 )
 
 
+# A name that ends in one of these carries a credential too: x-api-key, subscription-key, id_token.
+_CREDENTIAL_SUFFIXES = (
+    "key",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "signature",
+    "auth",
+    "authorization",
+    "credential",
+    "credentials",
+    "jwt",
+    "bearer",
+)
+
+
 def _param_name(name: str) -> str:
-    return re.sub(r"[-_]", "", name).lower()
+    return re.sub(r"[-_.]", "", name).lower()
+
+
+def credential_param(name: str) -> bool:
+    """Whether a query parameter with this name holds a credential."""
+    cleaned = _param_name(name)
+    return cleaned in _CREDENTIAL_PARAMS or cleaned.endswith(_CREDENTIAL_SUFFIXES)
 
 
 def split_url_credential(url: str) -> tuple[str, str]:
@@ -157,7 +186,7 @@ def split_url_credential(url: str) -> tuple[str, str]:
     kept: list[tuple[str, str]] = []
     found: set[str] = set()
     for name, value in parse_qsl(parts.query, keep_blank_values=True):
-        if _param_name(name) in _CREDENTIAL_PARAMS:
+        if credential_param(name):
             if value:
                 found.add(value)
             continue

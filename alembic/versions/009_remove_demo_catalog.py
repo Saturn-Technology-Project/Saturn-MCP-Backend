@@ -83,4 +83,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Nothing to restore, on purpose. The upgrade deletes demo rows and whatever referenced them;
+    # that data is gone, and putting demo agents back into a real organization would be wrong.
+    # Downgrading past this revision leaves the schema as revision 008 expects it.
     return

@@ -69,6 +69,11 @@ class MfaService:
         await consume(session, request, "signup", normalized)
         existing = await session.execute(select(User).where(User.email == normalized))
         if existing.scalar_one_or_none() is not None:
+            # Do the same two hashes a new address costs. Both answers are an empty 204, and the
+            # hashes are nearly all of the time either takes; skipping them here made a taken
+            # address answer measurably sooner than a free one.
+            await in_thread(hash_password, secret)
+            await in_thread(hash_password, _new_code())
             return None
         await self._close_open(session, normalized, "signup")
         code = _new_code()
@@ -390,7 +395,7 @@ class MfaService:
         record = await self._live_challenge(session, token)
         if record.code_hash is None:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Verification code is incorrect or expired")
-        if not login_code_open(record.user_id):
+        if not await login_code_open(record.user_id):
             raise HTTPException(
                 status.HTTP_429_TOO_MANY_REQUESTS,
                 "Too many incorrect codes. Try again tomorrow or use another sign-in method.",
@@ -399,7 +404,7 @@ class MfaService:
         used = await reserve_attempt(session, record, "attempts", MAX_ATTEMPTS)
         if used is None or not await in_thread(verify_password, code.strip(), record.code_hash):
             if used is not None:
-                login_code_failed(record.user_id)
+                await login_code_failed(record.user_id)
             if used is None or used >= MAX_ATTEMPTS:
                 record.used_at = utcnow()
             await session.flush()

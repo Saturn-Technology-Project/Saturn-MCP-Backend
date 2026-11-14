@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 
 from sqlalchemy import select
 
@@ -137,3 +138,111 @@ async def test_reseal_binds_old_vault_rows_to_their_entry(client):
         assert new.open(bound, organization_id, "") == "tok2"
     finally:
         await generator.aclose()
+
+
+async def test_reseal_recomputes_the_digests_a_waiting_approval_is_checked_against(client):
+    """The gateway stores {digest, sealed, encryption}; both digests must follow the key."""
+    from app.core.ids import new_id
+    from app.db.database import get_session
+    from app.features.execution.approvals.services.approval_arguments import keyed_digest, legacy_digest, server_sealed
+    from app.main import app
+    from app.models import Action, Approval, Run, User
+
+    generator = app.dependency_overrides[get_session]()
+    session = await anext(generator)
+    try:
+        user = (await session.scalars(select(User).where(User.email == "rick@saturn.ai"))).one()
+        organization_id = user.organization_id
+        arguments = {"amount": 900, "to": "acct_1"}
+
+        def waiting(stored, digest):
+            run = Run(id=new_id("run"), organization_id=organization_id, agent_id="agent_customer_ops", input="billing.refund", status="waiting_approval")
+            action = Action(id=new_id("act"), run_id=run.id, tool="billing.refund", arguments=stored, status="waiting_approval")
+            approval = Approval(id=new_id("apr"), run_id=run.id, action_id=action.id, status="pending", parameter_digest=digest)
+            session.add_all([run, action, approval])
+            return action.id, approval.id
+
+        digest = keyed_digest(organization_id, arguments)
+        sealed_action, sealed_approval = waiting({"digest": digest, **server_sealed(organization_id, arguments)}, digest)
+        # Rows from before digests were keyed hold a plain SHA-256, which no key change touches.
+        old_action, old_approval = waiting(dict(arguments), legacy_digest(arguments))
+        # Sealed for the organization's own key: the server cannot recompute these, and says so.
+        zero_action, zero_approval = waiting({"digest": digest, "envelope": {"org_key_version": 1}, "encryption": "payload-v1"}, digest)
+        await session.commit()
+
+        old, new = Keys(_local(OLD_ROOT)), Keys(_local(NEW_ROOT))
+        report = await reseal(await session.connection(), old, new, apply=True)
+        await session.commit()
+        session.expire_all()
+
+        assert report.digests == 2
+        moved = new.digest(organization_id, arguments)
+        action = await session.get(Action, sealed_action)
+        assert action.arguments["digest"] == moved
+        assert json.loads(new.open_content(action.arguments["sealed"], organization_id)) == arguments
+        assert (await session.get(Approval, sealed_approval)).parameter_digest == moved
+
+        assert (await session.get(Action, old_action)).arguments == arguments
+        assert (await session.get(Approval, old_approval)).parameter_digest == legacy_digest(arguments)
+
+        assert (await session.get(Action, zero_action)).arguments["digest"] == digest
+        assert (await session.get(Approval, zero_approval)).parameter_digest == digest
+        assert sorted(item.split(":")[0] for item in report.digests_left) == sorted([f"actions {zero_action}", f"approvals {zero_approval}"])
+        assert not report.unopened
+    finally:
+        await generator.aclose()
+
+
+class _Store:
+    def __init__(self, entries):
+        self.entries = dict(entries)
+        self.written = []
+
+    def names(self):
+        return sorted(self.entries)
+
+    def read(self, name):
+        return self.entries[name]
+
+    def write(self, name, blob):
+        self.written.append(name)
+        self.entries[name] = blob
+
+
+def test_reseal_moves_secret_manager_entries_and_can_be_repeated():
+    from app.cli.reseal import Report, Tenants, reseal_store, write_store
+    from app.features.credentials.vault.services.secret_vault import _gcp_name, _legacy_gcp_name, vault_context
+
+    old, new = Keys(_local(OLD_ROOT)), Keys(_local(NEW_ROOT))
+    tenants = Tenants({"user_a": "org_a", "user_b": "org_b"}, ["org_a", "org_b"])
+    named, personal, legacy = _gcp_name("mcp-1", "org_a"), _gcp_name("mcp-2", "org_b"), _legacy_gcp_name("mcp-3")
+    store = _Store(
+        {
+            named: old.seal("token-1", "org_a", "", vault_context("mcp-1")),
+            personal: old.seal("token-2", "org_b", "user_b", vault_context("mcp-2")),
+            legacy: old.seal("token-3", "org_b", ""),
+            "sat-not-ours": "plain text that is not a sealed value",
+            # Named for org_a but sealed for org_b: the name decides whose key is tried.
+            _gcp_name("mcp-4", "org_a"): old.seal("token-4", "org_b", ""),
+        }
+    )
+    stray = _gcp_name("mcp-4", "org_a")
+
+    report = Report()
+    pending = reseal_store(store, old, new, tenants, report)
+    assert report.resealed == {"secret_manager": 3}
+    assert report.unopened == [f"secret_manager {stray} ciphertext"]
+    assert store.written == []  # reading decides nothing is written yet
+
+    write_store(store, pending)
+    assert sorted(store.written) == sorted([named, personal, legacy])
+    assert new.open(store.entries[named], "org_a", "") == "token-1"
+    assert pq_crypto.split_bound(store.entries[named])[0] == vault_context("mcp-1")
+    assert new.open(store.entries[personal], "org_b", "user_b") == "token-2"
+    assert new.open(store.entries[legacy], "org_b", "") == "token-3"
+    assert old.open(store.entries[named], "org_a", "") is None
+
+    # A second run after a partial failure: what already moved is skipped, not reported as lost.
+    again = Report()
+    assert reseal_store(store, old, new, tenants, again) == []
+    assert len(again.already) == 3 and again.unopened == [f"secret_manager {stray} ciphertext"]

@@ -8,7 +8,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 
-from app.features.execution.approvals.services.approval_service import _uncertain
+from app.features.execution.approvals.services.claimed_call import is_uncertain as _uncertain
 from app.features.mcp.oauth.services import mcp_oauth as oauth_module
 from app.features.mcp.servers.services import mcp_remote
 from app.features.mcp.servers.services.mcp_remote import McpOutcomeUnknown, McpTimeout, _payload, _raise_for_status

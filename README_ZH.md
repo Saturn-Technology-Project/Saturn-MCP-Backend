@@ -133,7 +133,7 @@ docker compose up --build
 
 - API：http://localhost:8000
 - 文件：http://localhost:8000/docs（在 Cloud Run 上，或任何設定 `EXPOSE_API_DOCS=false` 的環境中關閉）
-- 健康檢查：`GET /health`（API 與資料庫狀態）與 `GET /healthz`（只回報正常或異常）
+- 健康檢查：`GET /health` 只要行程在服務就回 `{"status":"ok"}`，不檢查其他東西，所以探測不會因為某個依賴出問題而失敗。`GET /status` 回報每個服務（API、資料庫，以及有使用時的 Redis）；一律回 200，結果在內容裡，五秒內重複使用同一份。`GET /status/history` 回傳每個服務過去 90 天每天的可用率：worker 每分鐘檢查每個服務一次（API 是經由對外網址檢查），把結果累計到 `status_days` 當天那一列。主控台公開的 `/status` 頁面會把這兩者畫出來
 - Postgres：127.0.0.1:5433（使用者 `saturn`，密碼為 `POSTGRES_PASSWORD`）
 - Redis：127.0.0.1:6379（密碼為 `REDIS_PASSWORD`）
 
@@ -305,7 +305,7 @@ Agent 錢包與 x402 付款已經移除（遷移 `039_drop_wallets_x402`）。
 | `PUBLIC_WS_URL` | 本機為請求的 base URL；Cloud Run 上必填 | OAuth metadata、連結與 callback 使用的公開來源（`wss://` 與 `ws://` 對應到 `https://` 與 `http://`） |
 | `SATURN_GITHUB_OAUTH_CLIENT_ID` / `_SECRET` | 未設定 | GitHub MCP 伺服器使用的 OAuth App |
 | `SATURN_GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` | 未設定 | Google MCP 伺服器使用的 OAuth 用戶端 |
-| `ORIGIN_AUTH_SECRET` | 未設定 | 除了 `/healthz` 之外，每個請求都必須帶上的共用秘密；Cloud Run 上必填 |
+| `ORIGIN_AUTH_SECRET` | 未設定 | 除了 `/health` 之外，每個請求都必須帶上的共用秘密；Cloud Run 上必填 |
 | `ORIGIN_AUTH_SECRET_PREVIOUS` | 未設定 | 輪替期間也接受的舊秘密 |
 | `CONSOLE_PROXY_SECRET` | 未設定 | 與主控台共用；設定後，API 以主控台轉送的瀏覽器位址（`X-Saturn-Client-IP`）做速率限制 |
 | `CONSOLE_PROXY_SECRET_PREVIOUS` | 未設定 | 輪替期間也接受的舊秘密 |
@@ -346,7 +346,7 @@ Agent 錢包與 x402 付款已經移除（遷移 `039_drop_wallets_x402`）。
 ### 網路暴露面
 
 - **對外。** MCP 端點，以及它的 OAuth metadata 指向的每個 URL，都必須是 443 埠的 HTTPS、不含帳密、不是 IP 字面值或 metadata 主機，而且只解析到公開位址。MCP 端點還必須在允許清單中。Webhook 目的地必須是標準埠的 HTTPS。
-- **對內。** 在 Cloud Run 上，除了 `/healthz` 之外的每個請求都必須帶有 `ORIGIN_AUTH_SECRET`，所以只有邊緣代理能連到服務。`/healthz` 只回報正常或異常。
+- **對內。** 在 Cloud Run 上，除了 `/health` 之外的每個請求都必須帶有 `ORIGIN_AUTH_SECRET`，所以只有邊緣代理能連到服務。`/health` 只說明行程是否在服務。（`/healthz` 是同一個路由的舊名稱；Cloud Run 保留了這個路徑，不會轉給服務。）
 - **用戶端位址。** uvicorn 只信任來自 127.0.0.1 的 `X-Forwarded-*`。速率限制只有在來源驗證證明請求經過 Cloudflare 時才採用 `CF-Connecting-IP`，否則採用 `X-Forwarded-For` 最右邊的項目。
 - **速率限制**計數在 Redis 中，失敗時拒絕：連不到 Redis 時，受限制的路由會拒絕請求。
 - **請求大小。** 請求 body 超過 4 MiB 會被拒絕，登入與 OAuth 路由則是 64 KiB，在任何 handler 讀取之前就擋下。
@@ -366,7 +366,7 @@ pytest
 
 測試在記憶體中的 SQLite 上執行，使用 `IN_PROCESS_RUNTIME=true` 與固定的本機金庫金鑰，所以不需要 Postgres、Redis、KMS 或網路。Pytest 會載入本機的工具目錄 fixture（`tests/catalog.py`），讓執行迴圈的測試不依賴正式環境的初始資料。MCP 端點的 DNS 查詢會被替換成一個公開位址。
 
-[Test workflow](.github/workflows/test.yml) 在每次推送到 `main` 與每個 pull request 時執行：先以 gitleaks 掃描目前的檔案與完整歷史（執行檔以固定的 SHA-256 核對），再以雜湊驗證安裝，接著執行 `ruff check`、對正式環境鎖檔執行 `pip-audit`，最後執行 `pytest`。另一個 job 會把所有遷移套用到 PostgreSQL 16，再把最新的一支復原後重新套用。
+[Test workflow](.github/workflows/test.yml) 在每次推送到 `main` 與每個 pull request 時執行：先以 gitleaks 掃描目前的檔案與完整歷史（執行檔以固定的 SHA-256 核對），再以雜湊驗證安裝，接著執行 `ruff check`、對正式環境鎖檔執行 `pip-audit`，最後執行 `pytest`。另一個 job 會把所有遷移套用到 PostgreSQL 16，再把最新的一支復原後重新套用。第三個 job 會建置正式映像並在映像裡匯入應用程式，不會推送任何東西。遷移的寫法見 [`docs/migrations.md`](docs/migrations.md)。
 
 ## 相依套件與供應鏈
 

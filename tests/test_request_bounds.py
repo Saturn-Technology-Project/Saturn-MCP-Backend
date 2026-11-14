@@ -150,3 +150,28 @@ async def test_expiry_only_loads_approvals_that_are_due(client, monkeypatch):
     assert checked == [first]
     assert (await client.get(f"/approvals/{first}")).json()["status"] == "expired"
     assert (await client.get(f"/approvals/{second}")).json()["status"] == "pending"
+
+
+async def test_approval_policy_and_key_requests_have_field_limits(client):
+    long_name = await client.post("/org/approval-policies", json={"name": "n" * 256})
+    assert long_name.status_code == 422, long_name.text
+    many = await client.post(
+        "/org/approval-policies",
+        json={"name": "ok", "requirements": [{"group_id": "g", "required_count": 1}] * 51},
+    )
+    assert many.status_code == 422, many.text
+
+    oversized_key = await client.post("/org/payload-keys/member", json={"public_key": "a" * 16_385})
+    assert oversized_key.status_code == 422, oversized_key.text
+    # A real ML-KEM-1024 public key (3,136 hex characters) is nowhere near the limit.
+    assert 3_136 * 4 < 16_384
+
+
+async def test_approve_refuses_an_oversized_body_before_reading_it_as_json(client):
+    from app.features.execution.approvals.controllers.approvals import MAX_APPROVE_BODY_BYTES
+
+    body = b'{"arguments": {"note": "' + b"a" * MAX_APPROVE_BODY_BYTES + b'"}}'
+    answer = await client.post("/approvals/apr_missing/approve", content=body, headers={"Content-Type": "application/json"})
+    assert answer.status_code == 413, answer.text
+    # A normal body still reaches the approval lookup.
+    assert (await client.post("/approvals/apr_missing/approve", json={"arguments": {}})).status_code == 404

@@ -115,11 +115,11 @@ def _definition(raw: dict | None) -> dict:
     return definition
 
 
-def enforce_llm_quota(user_id: str, organization_id: str) -> None:
+async def enforce_llm_quota(user_id: str, organization_id: str) -> None:
     """Each call to these endpoints is billed by the model provider. Bound it per user and per organization."""
     from app.core.rate_limit import allow
 
-    if not allow(f"policy-llm:user:{user_id}", limit=LLM_USER_LIMIT, window=LLM_WINDOW_SECONDS) or not allow(
+    if not await allow(f"policy-llm:user:{user_id}", limit=LLM_USER_LIMIT, window=LLM_WINDOW_SECONDS) or not await allow(
         f"policy-llm:org:{organization_id}", limit=LLM_ORG_LIMIT, window=LLM_WINDOW_SECONDS
     ):
         raise HTTPException(

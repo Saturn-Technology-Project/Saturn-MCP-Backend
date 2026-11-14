@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.ids import new_id, utcnow
+from app.features.credentials.vault.services.pq_crypto import KeyUnavailable
 from app.features.credentials.vault.services.secret_vault import get_secret, put_secret
 from app.features.organization.org.services.plans import PRO_REQUIRED, allows_pro
 from app.models import Organization
@@ -41,6 +42,10 @@ BATCH_LIMIT = 50
 PER_ORG_LIMIT = 5
 CONCURRENCY = 10
 SCAN_LIMIT = 500
+# A delivery being sent is pushed this far into the future before its transaction commits, so no
+# row lock or transaction is open during the HTTP request and no other worker picks it meanwhile.
+# If this process dies mid-send the delivery simply becomes due again: at least once, as before.
+CLAIM_SECONDS = TOTAL_TIMEOUT_SECONDS * 6
 
 
 def max_attempts() -> int:
@@ -53,6 +58,10 @@ def backoff_seconds(attempt: int) -> float:
 
 
 def disabled_delay_seconds() -> int:
+    return 60
+
+
+def key_unavailable_delay_seconds() -> int:
     return 60
 
 
@@ -546,6 +555,7 @@ async def deliver_due(
         job = await _prepare(session, row, moment)
         if job is not None:
             jobs.append(job)
+    await _claim(session, jobs, moment)
     gate = asyncio.Semaphore(CONCURRENCY)
 
     async def run(job: _Job) -> tuple[int | None, str]:
@@ -554,7 +564,8 @@ async def deliver_due(
 
     results = await asyncio.gather(*(run(job) for job in jobs))
     for job, (code, error) in zip(jobs, results, strict=True):
-        await _record(session, job, moment, code, error)
+        if await _still_there(session, job):
+            await _record(session, job, moment, code, error)
     await session.flush()
     return len(picked)
 
@@ -563,8 +574,32 @@ async def deliver_one(session: AsyncSession, row: WebhookDelivery, now: datetime
     job = await _prepare(session, row, now)
     if job is None:
         return
+    await _claim(session, [job], now)
     code, error = await send_webhook(job.url, job.body, job.headers)
+    if not await _still_there(session, job):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Webhook delivery not found")
     await _record(session, job, now, code, error)
+
+
+async def _claim(session: AsyncSession, jobs: list[_Job], now: datetime) -> None:
+    """Commit what was decided so far and release the rows before anything is sent.
+
+    Sending used to happen inside the transaction that had locked the rows, so a slow receiver
+    held row locks and a pooled connection for the whole request.
+    """
+    for job in jobs:
+        job.row.next_attempt_at = now + timedelta(seconds=CLAIM_SECONDS)
+        job.row.updated_at = now
+    await session.commit()
+
+
+async def _still_there(session: AsyncSession, job: _Job) -> bool:
+    """Lock the row again to record the outcome. False when it was deleted while the request was out."""
+    fresh = await session.get(WebhookDelivery, job.row.id, populate_existing=True, with_for_update=True)
+    if fresh is None:
+        return False
+    job.row = fresh
+    return True
 
 
 async def _prepare(session: AsyncSession, row: WebhookDelivery, now: datetime) -> _Job | None:
@@ -592,6 +627,11 @@ async def _prepare(session: AsyncSession, row: WebhookDelivery, now: datetime) -
         secret = await get_secret(session, endpoint.secret_id, row.organization_id)
     except HTTPException:
         await _finish(session, row, now, None, "destination not allowed", secret, dead=True)
+        return None
+    except KeyUnavailable:
+        # The key service did not answer. The secret itself is fine: wait, and do not count an attempt.
+        row.next_attempt_at = now + timedelta(seconds=key_unavailable_delay_seconds())
+        row.updated_at = now
         return None
     except Exception:
         await _finish(session, row, now, None, "signing secret unavailable", "", dead=True)

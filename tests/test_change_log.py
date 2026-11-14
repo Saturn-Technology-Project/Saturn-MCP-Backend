@@ -107,3 +107,50 @@ async def test_member_and_removal_changes_are_recorded_and_only_team_readers_see
     # None of this shows up in the tool-call activity list.
     events = {item["event"] for item in (await client.get("/activity")).json()}
     assert not events & {"member_updated", "member_invited", "agent_deleted", "mcp_server_deleted"}
+
+
+async def test_what_the_platform_does_inside_a_tenant_is_in_that_tenants_change_log(client, monkeypatch):
+    async def sent(_email, _code, _locale=None):
+        return None
+
+    monkeypatch.setattr("app.shared.runtime.email_configured", lambda: True)
+    monkeypatch.setattr("app.features.identity.auth.services.mailer.send_reset_code", sent)
+    created = await client.post(
+        "/admin/orgs",
+        json={
+            "name": "Acme",
+            "admin_email": "admin@acme.test",
+            "admin_name": "Acme Admin",
+            "admin_password": "password1",
+            "plan": "enterprise",
+        },
+    )
+    assert created.status_code == 201, created.text
+    org = created.json()
+    added = await client.post(
+        f"/admin/orgs/{org['id']}/members",
+        json={"email": "planted@acme.test", "name": "Planted", "password": "password1", "role": "admin"},
+    )
+    assert added.status_code == 201, added.text
+    assert (await client.patch(f"/admin/orgs/{org['id']}", json={"status": "trial"})).status_code == 200
+    assert (await client.post(f"/admin/orgs/{org['id']}/members/{added.json()['id']}/password")).status_code == 200
+
+    login = await client.post("/auth/login", json={"email": "admin@acme.test", "password": "password1"})
+    assert login.status_code == 200, login.text
+    tenant = {"Authorization": f"Bearer {login.json()['token']}"}
+    from tests.totp_access import finish_totp
+
+    await finish_totp(client, tenant)
+    rows = await _changes(client, tenant)
+    platform = (await client.get("/auth/me")).json()["id"]
+
+    member = _named(rows, "member_created")
+    assert [item["payload"]["email"] for item in member] == ["planted@acme.test"]
+    assert member[0]["payload"]["role"] == "admin" and member[0]["payload"]["employee_id"] == added.json()["id"]
+    assert _named(rows, "org_updated")[0]["payload"]["status"] == "trial"
+    assert _named(rows, "member_password_reset")[0]["payload"]["employee_id"] == added.json()["id"]
+    for item in member + _named(rows, "org_updated") + _named(rows, "member_password_reset"):
+        assert item["actor_id"] == platform and item["payload"]["platform_admin"] is True
+
+    # The platform's own organization sees none of it.
+    assert not {item["event"] for item in await _changes(client)} & {"member_created", "org_updated", "member_password_reset"}

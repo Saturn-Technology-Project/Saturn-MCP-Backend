@@ -82,8 +82,8 @@ from app.features.tooling.tool_sets.services.tool_set_service import tool_set_se
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
-def _require_code_check(request: Request, subject: str | None = None) -> None:
-    if not code_check_allowed(request, subject):
+async def _require_code_check(request: Request, subject: str | None = None) -> None:
+    if not await code_check_allowed(request, subject):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "Too many attempts",
@@ -145,19 +145,24 @@ async def serialize_user(session, user: User) -> UserRead:
             members = await member_service.list_members(session, user.organization_id)
             users = [serialize_org_user(item) for item in members]
 
-    agents = [
-        serialize_agent(agent)
-        for agent in await mapping_service.list_org_agents(session, user.organization_id)
-        if str((agent.settings or {}).get("origin") or "") != "saturn_mcp"
-    ]
-    servers = [
-        serialize_mcp_server(server)
-        for server in await mapping_service.list_mcp_servers(session, user)
-    ]
-    tool_sets = [
-        serialize_tool_set(item)
-        for item in await tool_set_service.list_sets(session, user.organization_id)
-    ]
+    # Each list needs the access its own endpoint asks for (GET /agents, /mcp-servers, /tool-sets).
+    # Without the check, a member with no agent access still received every agent's instructions here.
+    agents, servers, tool_sets = [], [], []
+    if allows(permissions, "agents", "read"):
+        agents = [
+            serialize_agent(agent)
+            for agent in await mapping_service.list_org_agents(session, user.organization_id)
+            if str((agent.settings or {}).get("origin") or "") != "saturn_mcp"
+        ]
+        servers = [
+            serialize_mcp_server(server)
+            for server in await mapping_service.list_mcp_servers(session, user)
+        ]
+    if allows(permissions, "policies", "read"):
+        tool_sets = [
+            serialize_tool_set(item)
+            for item in await tool_set_service.list_sets(session, user.organization_id)
+        ]
     snapshot = mcp_gateway.snapshot(user.organization_id)
     return UserRead(
         id=user.id,
@@ -232,7 +237,7 @@ async def _begin_mfa(session, user: User, locale: str | None) -> LoginResponse |
 
 @router.post("/register/code", status_code=204)
 async def register_code(body: SignupCodeRequest, request: Request, session: SessionDep, background: BackgroundTasks):
-    if not signup_allowed(request):
+    if not await signup_allowed(request):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "Too many attempts",
@@ -252,7 +257,7 @@ async def register_code(body: SignupCodeRequest, request: Request, session: Sess
 
 @router.post("/register", response_model=LoginResponse, status_code=201)
 async def register(body: RegisterRequest, request: Request, response: Response, session: SessionDep):
-    if not signup_allowed(request):
+    if not await signup_allowed(request):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "Too many attempts",
@@ -277,7 +282,7 @@ async def register(body: RegisterRequest, request: Request, response: Response, 
 
 @router.post("/login/migration")
 async def login_migration(body: LoginRequest, request: Request, session: SessionDep):
-    if not migration_allowed(request, body.email):
+    if not await migration_allowed(request, body.email):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "Too many attempts",
@@ -309,7 +314,7 @@ async def login_migration(body: LoginRequest, request: Request, session: Session
 
 @router.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest, request: Request, response: Response, session: SessionDep):
-    if not login_allowed(request, body.email):
+    if not await login_allowed(request, body.email):
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,
             "Too many attempts",
@@ -326,9 +331,9 @@ async def login(body: LoginRequest, request: Request, response: Response, sessio
     except HTTPException as exc:
         if exc.status_code != status.HTTP_401_UNAUTHORIZED:
             # Not a wrong password, so it does not count against the account.
-            login_succeeded(body.email)
+            await login_succeeded(body.email)
         raise
-    login_succeeded(body.email)
+    await login_succeeded(body.email)
     pending = await _begin_mfa(session, user, body.locale)
     if pending is not None:
         return pending
@@ -337,7 +342,7 @@ async def login(body: LoginRequest, request: Request, response: Response, sessio
 
 @router.post("/login/email", response_model=LoginResponse)
 async def login_email(body: LoginEmailRequest, request: Request, response: Response, session: SessionDep):
-    _require_code_check(request)
+    await _require_code_check(request)
     user, further = await mfa_service.finish_email(session, body.challenge, body.code)
     if further:
         # An admin with a passkey or an authenticator app still has to use it.
@@ -352,7 +357,7 @@ class LoginTotpRequest(BaseModel):
 
 @router.post("/login/totp", response_model=LoginResponse)
 async def login_totp(body: LoginTotpRequest, request: Request, response: Response, session: SessionDep):
-    _require_code_check(request)
+    await _require_code_check(request)
     user = await mfa_service.finish_totp(session, body.challenge, body.code)
     return await _issue_login(session, request, response, user)
 
@@ -437,7 +442,7 @@ async def totp_confirm(
 ):
     from app.features.identity.auth.services.totp import confirm_setup
 
-    _require_code_check(request, user.id)
+    await _require_code_check(request, user.id)
     await _require_step_up(request, session, creds)
     await confirm_setup(session, user, body.code)
     background.add_task(send_factor_added, user.email, "totp", user.locale)
@@ -447,7 +452,7 @@ async def totp_confirm(
 async def totp_verify(body: TotpConfirmRequest, request: Request, user: CurrentUser, session: SessionDep):
     from app.features.identity.auth.services.totp import verify_user_totp
 
-    _require_code_check(request, user.id)
+    await _require_code_check(request, user.id)
     await verify_user_totp(session, user, body.code)
 
 
@@ -477,7 +482,7 @@ async def mfa_email_code(
 
 @router.post("/mfa/email", status_code=204)
 async def mfa_email_enable(body: MfaCodeRequest, request: Request, user: CurrentUser, session: SessionDep):
-    _require_code_check(request, user.id)
+    await _require_code_check(request, user.id)
     await mfa_service.enable_email_mfa(session, user, body.code)
 
 
@@ -539,7 +544,7 @@ async def reauthenticate(
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ):
     token = _presented_token(request, creds)
-    if not reauth_allowed(user.id):
+    if not await reauth_allowed(user.id):
         raise _too_many("900")
     if body.password:
         if not await in_thread(verify_password, body.password, user.password_hash):
@@ -576,7 +581,7 @@ async def confirm_email_change(
     session: SessionDep,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
 ):
-    _require_code_check(request, user.id)
+    await _require_code_check(request, user.id)
     from app.features.execution.activity.services import payload_key_service as keys
 
     # Everything that can refuse the request is checked before the address changes.
@@ -640,7 +645,7 @@ async def logout(
 
 @router.get("/me", response_model=UserRead)
 async def me(user: CurrentUser, session: SessionDep):
-    await mapping_service.bind_workspace(session, user)
+    await mapping_service.bind_workspace(session, user, links=False)
     return await serialize_user(session, user)
 
 
@@ -686,7 +691,7 @@ async def update_me(
 
 @router.post("/accept-invite", response_model=LoginResponse)
 async def accept_invite(body: AcceptInviteRequest, request: Request, response: Response, session: SessionDep):
-    if not accept_invite_allowed(request):
+    if not await accept_invite_allowed(request):
         raise _too_many()
     user = await member_service.accept_invite(session, body.token, body.password)
     await mapping_service.bind_workspace(session, user)
@@ -707,7 +712,7 @@ async def forgot_password(body: ForgotPasswordRequest, request: Request, session
 
 @router.post("/reset-password", status_code=204)
 async def reset_password(body: ResetPasswordRequest, request: Request, session: SessionDep):
-    _require_code_check(request, body.email)
+    await _require_code_check(request, body.email)
     await auth_service.reset_password(session, body.email, body.code, body.password)
 
 

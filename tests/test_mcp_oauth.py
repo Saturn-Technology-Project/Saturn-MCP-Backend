@@ -154,6 +154,7 @@ async def test_github_401_asks_for_sign_in_instead_of_failing(monkeypatch):
             return None
 
         def build_request(self, method, url, **kwargs):
+            kwargs.pop("timeout", None)  # a client setting, not part of the request
             return httpx.Request(method, url, **kwargs)
 
         async def send(self, request, **kwargs):
@@ -463,3 +464,95 @@ def test_browser_cookie_reaches_the_callback_host():
     # Never a public suffix alone.
     assert browser_cookie_domain("https://a.com", "https://b.com") is None
     assert browser_cookie_domain("http://127.0.0.1:3000", "http://127.0.0.2:8000") is None
+
+
+async def _expired_connection(session, server_id: str = "mcp_email"):
+    from datetime import timedelta
+
+    from app.core.ids import utcnow
+    from app.features.mcp.servers.services.mcp_grant import write_grant
+    from app.models import McpServer
+
+    server = await session.get(McpServer, server_id)
+    server.oauth_client_id = "saturn-client"
+    server.oauth_token_endpoint = "https://auth.example/token"
+    server.token_expires_at = utcnow() - timedelta(minutes=1)
+    await write_grant(session, server, {"access_token": "access-1", "refresh_token": "refresh-1", "client_secret": ""})
+    await session.commit()
+
+
+async def test_two_calls_refreshing_at_once_present_the_refresh_token_once(client, monkeypatch):
+    """A provider that rotates refresh tokens revokes the grant when an old one is presented again."""
+    import asyncio
+
+    from app.db.database import get_session
+    from app.features.mcp.oauth.services import mcp_oauth as module
+    from app.features.mcp.servers.services.mcp_grant import read_grant
+    from app.main import app
+    from app.models import McpServer
+
+    presented: list[str] = []
+
+    async def token(_url, form):
+        presented.append(form["refresh_token"])
+        await asyncio.sleep(0.05)
+        if form["refresh_token"] != "refresh-1":
+            raise AssertionError("an old refresh token was presented again")
+        return {"access_token": "access-2", "refresh_token": "refresh-2", "expires_in": 3600}
+
+    monkeypatch.setattr(module, "_token", token)
+
+    async def call():
+        generator = app.dependency_overrides[get_session]()
+        session = await anext(generator)
+        try:
+            return await module.mcp_oauth.authorization_for(session, await session.get(McpServer, "mcp_email"))
+        finally:
+            await generator.aclose()
+
+    generator = app.dependency_overrides[get_session]()
+    session = await anext(generator)
+    try:
+        await _expired_connection(session)
+    finally:
+        await generator.aclose()
+
+    assert await asyncio.gather(call(), call()) == ["access-2", "access-2"]
+    assert presented == ["refresh-1"]
+
+    generator = app.dependency_overrides[get_session]()
+    session = await anext(generator)
+    try:
+        grant = await read_grant(session, await session.get(McpServer, "mcp_email"))
+        assert grant["refresh_token"] == "refresh-2" and grant["access_token"] == "access-2"
+    finally:
+        await generator.aclose()
+
+
+async def test_a_rotated_refresh_token_survives_a_request_that_fails_afterwards(client, monkeypatch):
+    from app.db.database import get_session
+    from app.features.mcp.oauth.services import mcp_oauth as module
+    from app.features.mcp.servers.services.mcp_grant import read_grant
+    from app.main import app
+    from app.models import McpServer
+
+    async def token(_url, _form):
+        return {"access_token": "access-2", "refresh_token": "refresh-2", "expires_in": 3600}
+
+    monkeypatch.setattr(module, "_token", token)
+    generator = app.dependency_overrides[get_session]()
+    session = await anext(generator)
+    try:
+        await _expired_connection(session)
+        server = await session.get(McpServer, "mcp_email")
+        assert await module.mcp_oauth.refresh_after_reject(session, server, "access-1") == "access-2"
+        # The request goes on to fail. The provider has already retired refresh-1.
+        await session.rollback()
+        session.expire_all()
+        grant = await read_grant(session, await session.get(McpServer, "mcp_email"), fresh=True)
+        assert grant["refresh_token"] == "refresh-2"
+        # A second caller that was refused the same old token takes the stored one; nothing is exchanged again.
+        monkeypatch.setattr(module, "_token", None)
+        assert await module.mcp_oauth.refresh_after_reject(session, server, "access-1") == "access-2"
+    finally:
+        await generator.aclose()

@@ -4,15 +4,17 @@ import asyncio
 import json
 import re
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import HTTPException, status
 
-from app.features.mcp.servers.services.mcp_endpoint import pin_mcp_url, require_mcp_endpoint
+from app.features.mcp.servers.services.mcp_endpoint import credential_param, pin_mcp_url, require_mcp_endpoint
 
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
-_SECRET_QUERY = re.compile(r"(?i)((?:api[_-]?key|access[_-]?token|token|key|secret|signature|sig)=)[^&\s'\"]+")
+_SECRET_QUERY = re.compile(
+    r"(?i)((?:api[_-]?key|access[_-]?token|token|key|secret|signature|sig|password|passwd|pwd|auth|authorization|credentials?|jwt|bearer)=)[^&\s'\"]+"
+)
 
 
 class McpTimeout(HTTPException):
@@ -47,10 +49,19 @@ def redact(text: str, *secrets: str) -> str:
 
 
 def redact_url(url: str) -> str:
+    """The URL with the value of every credential query parameter replaced.
+
+    Uses the same rule that keeps credentials out of a stored endpoint, so an endpoint stored
+    before that rule covered a name is still never shown with its key.
+    """
     parts = urlsplit(url or "")
     if not parts.query:
         return url
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, redact(parts.query), ""))
+    pieces = []
+    for piece in parts.query.split("&"):
+        name, separator, _value = piece.partition("=")
+        pieces.append(f"{name}=***" if separator and credential_param(unquote(name)) else piece)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, redact("&".join(pieces)), ""))
 
 
 def sec_api_request(endpoint: str, authorization: str) -> tuple[str, str]:
@@ -180,6 +191,34 @@ def _raise_for_status(response: httpx.Response, endpoint: str, *, call: bool = F
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.UnsupportedProtocol, httpx.InvalidURL)
 
 
+# A kept connection the server has since closed fails like this on its next use.
+_STALE = (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.CloseError)
+
+# One client per upstream host name, so calls reuse its TLS connections instead of opening a
+# new one each time. Never one client for all hosts: requests go to a pinned address, and the
+# pool finds connections by address, so a shared pool could send a request for one name over a
+# connection whose certificate was checked for another name on the same address. The names come
+# from ALLOWED_MCP_HOSTS, which bounds how many clients exist.
+_clients: dict[str, httpx.AsyncClient] = {}
+_LIMITS = httpx.Limits(max_connections=50, max_keepalive_connections=10, keepalive_expiry=30)
+
+
+def _client_for(host: str) -> httpx.AsyncClient:
+    client = _clients.get(host)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(follow_redirects=False, trust_env=False, limits=_LIMITS)
+        _clients[host] = client
+    return client
+
+
+async def close_clients() -> None:
+    """Close every kept connection. Called when the application stops."""
+    clients = list(_clients.values())
+    _clients.clear()
+    for client in clients:
+        await client.aclose()
+
+
 async def _rpc(
     client: httpx.AsyncClient,
     endpoint: str,
@@ -188,6 +227,42 @@ async def _rpc(
     params: dict[str, Any],
     request_id: int,
     sni: str = "",
+    *,
+    timeout: float = 60,  # noqa: ASYNC109 (httpx's per-phase timeouts for this request, not a deadline for the coroutine)
+) -> httpx.Response:
+    # initialize changes nothing upstream, so it is sent again when a kept connection turns out
+    # to be dead. tools/call never is: it follows on the connection initialize just proved alive,
+    # and a failure there leaves the outcome unknown.
+    attempts = 2 if method == "initialize" else 1
+    for attempt in range(attempts):
+        try:
+            return await _send(client, endpoint, headers, method, params, request_id, sni, timeout)
+        except _STALE as exc:
+            if attempt + 1 < attempts:
+                continue
+            raise _transport_error(exc, method) from None
+        except httpx.HTTPError as exc:
+            raise _transport_error(exc, method) from None
+    raise AssertionError("unreachable")
+
+
+def _transport_error(exc: httpx.HTTPError, method: str) -> HTTPException:
+    # Never put str(exc) in the detail: it can carry the request URL, and SEC-API keys live in its query.
+    kind = type(exc).__name__
+    if method == "tools/call" and not isinstance(exc, _NOT_SENT):
+        return McpTimeout(f"MCP server did not answer ({kind})")
+    return HTTPException(status.HTTP_502_BAD_GATEWAY, f"Could not reach MCP server ({kind})")
+
+
+async def _send(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    headers: dict[str, str],
+    method: str,
+    params: dict[str, Any],
+    request_id: int,
+    sni: str,
+    timeout: float,  # noqa: ASYNC109
 ) -> httpx.Response:
     request = client.build_request(
         "POST",
@@ -195,25 +270,17 @@ async def _rpc(
         headers=headers,
         json={"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
         extensions={"sni_hostname": sni} if sni else None,
+        timeout=timeout,
     )
+    response = await client.send(request, stream=True)
     try:
-        response = await client.send(request, stream=True)
-        try:
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > MAX_RESPONSE_BYTES:
-                    raise _unreadable("MCP server response is too large", method == "tools/call")
-        finally:
-            await response.aclose()
-    except HTTPException:
-        raise
-    except httpx.HTTPError as exc:
-        # Never put str(exc) in the detail: it can carry the request URL, and SEC-API keys live in its query.
-        kind = type(exc).__name__
-        if method == "tools/call" and not isinstance(exc, _NOT_SENT):
-            raise McpTimeout(f"MCP server did not answer ({kind})") from None
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"Could not reach MCP server ({kind})") from None
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise _unreadable("MCP server response is too large", method == "tools/call")
+    finally:
+        await response.aclose()
     kept = {
         key: value
         for key, value in response.headers.items()
@@ -233,30 +300,40 @@ def _target(endpoint: str, authorization: str) -> tuple[str, str, str, str]:
 async def list_remote_tools(endpoint: str, authorization: str = "") -> list[dict[str, Any]]:
     url, request_url, header_auth, host = await asyncio.to_thread(_target, endpoint, authorization)
     headers = {**_headers(header_auth), "Host": host}
-    async with httpx.AsyncClient(timeout=20, follow_redirects=False, trust_env=False) as client:
-        init = await _rpc(
-            client,
-            request_url,
-            headers,
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "Saturn", "version": "0.1.0"},
-            },
-            1,
-            host,
-        )
-        _raise_for_status(init, url)
-        session_id = init.headers.get("mcp-session-id", "")
-        if session_id:
-            headers = {**_headers(header_auth, session_id), "Host": host}
-        listed = await _rpc(client, request_url, headers, "tools/list", {}, 2, host)
+    client = _client_for(host)
+    init = await _rpc(
+        client,
+        request_url,
+        headers,
+        "initialize",
+        {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "Saturn", "version": "0.1.0"},
+        },
+        1,
+        host,
+        timeout=20,
+    )
+    _raise_for_status(init, url)
+    session_id = init.headers.get("mcp-session-id", "")
+    if session_id:
+        headers = {**_headers(header_auth, session_id), "Host": host}
+    listed = await _rpc(client, request_url, headers, "tools/list", {}, 2, host, timeout=20)
     _raise_for_status(listed, url)
     tools = _tools(_payload(listed))
     if not tools:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, "MCP server did not list any tools")
     return tools
+
+
+def split_reply(body: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """(reply as sent, tool result). Real MCP replies are a JSON-RPC envelope. Test doubles return the tool result itself."""
+    if "result" in body and ("jsonrpc" in body or "id" in body):
+        result = body.get("result")
+        tool = result if isinstance(result, dict) else ({"value": result} if result is not None else {})
+        return body, tool
+    return body, body
 
 
 async def call_remote_tool(
@@ -267,33 +344,33 @@ async def call_remote_tool(
 ) -> dict[str, Any]:
     url, request_url, header_auth, host = await asyncio.to_thread(_target, endpoint, authorization)
     headers = {**_headers(header_auth), "Host": host}
-    async with httpx.AsyncClient(timeout=60, follow_redirects=False, trust_env=False) as client:
-        init = await _rpc(
-            client,
-            request_url,
-            headers,
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "Saturn", "version": "0.1.0"},
-            },
-            1,
-            host,
-        )
-        _raise_for_status(init, url)
-        session_id = init.headers.get("mcp-session-id", "")
-        if session_id:
-            headers = {**_headers(header_auth, session_id), "Host": host}
-        called = await _rpc(
-            client,
-            request_url,
-            headers,
-            "tools/call",
-            {"name": name, "arguments": arguments},
-            2,
-            host,
-        )
+    client = _client_for(host)
+    init = await _rpc(
+        client,
+        request_url,
+        headers,
+        "initialize",
+        {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "Saturn", "version": "0.1.0"},
+        },
+        1,
+        host,
+    )
+    _raise_for_status(init, url)
+    session_id = init.headers.get("mcp-session-id", "")
+    if session_id:
+        headers = {**_headers(header_auth, session_id), "Host": host}
+    called = await _rpc(
+        client,
+        request_url,
+        headers,
+        "tools/call",
+        {"name": name, "arguments": arguments},
+        2,
+        host,
+    )
     _raise_for_status(called, url, call=True)
     body = _payload(called, call=True)
     if body.get("error"):

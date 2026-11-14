@@ -416,6 +416,10 @@ def _fake_client(monkeypatch, handler):
         return _REAL_CLIENT(*args, **kwargs)
 
     monkeypatch.setattr("app.features.mcp.servers.services.mcp_remote.httpx.AsyncClient", build)
+    # Upstream clients are kept per host: drop the ones built around an earlier handler.
+    from app.features.mcp.servers.services import mcp_remote
+
+    mcp_remote._clients.clear()
 
 
 def _rpc_handler(on_call):
@@ -431,7 +435,7 @@ def _rpc_handler(on_call):
 async def test_tools_call_timeout_is_uncertain_and_hides_the_key(monkeypatch):
     from fastapi import HTTPException
 
-    from app.features.execution.approvals.services.approval_service import _uncertain
+    from app.features.execution.approvals.services.claimed_call import is_uncertain as _uncertain
     from app.features.mcp.servers.services.mcp_remote import McpTimeout, call_remote_tool
 
     def timeout(request):
@@ -757,7 +761,8 @@ async def test_an_executed_result_is_stored_sealed_and_still_replays(client, mon
         action = (await session.scalars(select(Action).where(Action.run_id == run_id))).one()
         # What the upstream answered is not readable in the database.
         assert set(action.result) == {"sealed", "encryption"}
-        assert "echo" not in str(action.result) and "900" not in str(action.result)
+        # Checked with words hex cannot spell: the ciphertext is random hex, which holds "900" now and then.
+        assert "echo" not in str(action.result) and "amount" not in str(action.result)
         # A run response carries a marker, not the result or its ciphertext.
         assert ActionRead.model_validate(action).result == {"sealed": True}
     finally:

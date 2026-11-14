@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from fastapi import HTTPException, status
-from sqlalchemy import select, update
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.enums import ActorType, AuditEvent
+from app.core.enums import ActorType, ApprovalStatus, AuditEvent, ExecutionState, ExpiryPhase
 from app.core.ids import utcnow
 from app.features.execution.activity.services.audit_service import audit_service
 from app.features.execution.approvals.models.approval import Approval, ApprovalPolicy, ApprovalWindow
+from app.features.execution.approvals.models.transitions import EXPIRE
+from app.features.execution.approvals.services.lifecycle import approval_lifecycle
 from app.features.webhooks.services.webhook_service import publish_approval
 from app.models import Action, Run
 
@@ -35,14 +37,6 @@ def _text(value) -> str:
     if value is None:
         return ""
     return value.value if hasattr(value, "value") else str(value)
-
-
-def _as_utc(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
 
 
 async def window_minutes(session: AsyncSession, organization_id: str) -> tuple[int, int]:
@@ -129,43 +123,17 @@ async def notify_transition(
 
 
 async def expire_if_due(session: AsyncSession, approval: Approval, now: datetime) -> str | None:
-    current = _text(approval.status)
-    if current == "expired":
-        return approval.expired_phase or "pending"
-    phase = None
-    if current == "pending":
-        deadline = _as_utc(approval.expires_at)
-        if deadline is not None and deadline <= now:
-            phase = "pending"
-    elif current == "approved" and (approval.execution_state or "none") == "none":
-        deadline = _as_utc(approval.resubmit_expires_at)
-        if deadline is not None and deadline <= now:
-            phase = "resubmit"
+    """Expire the approval if a deadline has passed. Returns the phase it expired in, if it is expired."""
+    if approval.is_expired:
+        return approval.expired_phase or ExpiryPhase.PENDING.value
+    phase = approval.due_phase(now)
     if phase is None:
         return None
-    values: dict = {"status": "expired", "expired_phase": phase}
-    if phase == "pending":
-        values["resolved_at"] = now
-    result = await session.execute(
-        update(Approval)
-        .where(
-            Approval.id == approval.id,
-            Approval.status == current,
-            Approval.execution_state == "none",
-        )
-        .values(**values)
-    )
-    if result.rowcount != 1:
-        await session.refresh(approval)
-        if _text(approval.status) == "expired":
-            return approval.expired_phase or phase
-        return None
-    approval.status = "expired"
-    approval.expired_phase = phase
-    if phase == "pending":
-        approval.resolved_at = now
-    await _record_expiry(session, approval, phase, now)
-    return phase
+    if not await approval_lifecycle.move(session, approval, EXPIRE[phase], now=now):
+        # Someone decided, claimed or expired it first.
+        return (approval.expired_phase or phase.value) if approval.is_expired else None
+    await _record_expiry(session, approval, phase.value, now)
+    return phase.value
 
 
 EXPIRE_BATCH = 500
@@ -183,13 +151,13 @@ async def expire_due(
     """
     moment = now or utcnow()
     pending = select(Approval).where(
-        Approval.status == "pending",
+        Approval.status == ApprovalStatus.PENDING.value,
         Approval.expires_at.is_not(None),
         Approval.expires_at <= moment,
     )
     waiting = select(Approval).where(
-        Approval.status == "approved",
-        Approval.execution_state == "none",
+        Approval.status == ApprovalStatus.APPROVED.value,
+        Approval.execution_state == ExecutionState.NONE.value,
         Approval.resubmit_expires_at.is_not(None),
         Approval.resubmit_expires_at <= moment,
     )

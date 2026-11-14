@@ -12,6 +12,7 @@ import asyncio
 import base64
 import logging
 import os
+import threading
 import time
 
 from cryptography.hazmat.primitives import hashes, hmac
@@ -35,6 +36,20 @@ class SecretNeedsReconnect(Exception):
 
     def __init__(self) -> None:
         super().__init__("This secret needs to be connected again")
+
+
+class KeyUnavailable(Exception):
+    """The tenant key could not be derived just now (KMS did not answer, or is not configured).
+
+    Nothing is wrong with the stored value, so this is never reported as SecretNeedsReconnect:
+    a caller that treated it that way would tell people to reconnect, or give up on a delivery,
+    over an outage that ends by itself.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("The key service is unavailable")
+
+
 _INFO_AES = b"saturn-credential-aes-256-gcm-v1"
 # Full cryptoKeyVersion resource name, for example .../cryptoKeys/kem-root/cryptoKeyVersions/N.
 # Rotation creates a new version and points SATURN_KMS_KEY at it. Existing ciphertext stays
@@ -42,10 +57,15 @@ _INFO_AES = b"saturn-credential-aes-256-gcm-v1"
 # open with the old version, then seal again after the setting changes.
 _KMS_ENV = "SATURN_KMS_KEY"
 _CONTENT_TTL_SECONDS = 300.0
+# warm_content_key renews a key this long before it expires, so one request never outlives it.
+_WARM_MARGIN_SECONDS = 60.0
 _root: bytes | None = None
 _keys: dict[tuple[str, str, str], MLKEM1024PrivateKey] = {}
 _MAX_CACHED_KEYS = 256
 _content_keys: dict[str, tuple[float, bytes]] = {}
+# seal and open run on worker threads (asyncio.to_thread), several at a time. The lock covers
+# only the two caches; a KMS call is never made while holding it.
+_cache_lock = threading.Lock()
 _kms_client = None
 
 
@@ -59,8 +79,9 @@ def install_root(root: bytes) -> None:
     if len(root) < 32:
         raise RuntimeError("local root must be at least 32 bytes")
     _root = root
-    _keys.clear()
-    _content_keys.clear()
+    with _cache_lock:
+        _keys.clear()
+        _content_keys.clear()
 
 
 def _mac(data: bytes) -> bytes:
@@ -104,16 +125,43 @@ def content_key(organization_id: str) -> bytes:
     if not organization_id:
         raise RuntimeError("organization id is required")
     now = time.monotonic()
-    cached = _content_keys.get(organization_id)
+    with _cache_lock:
+        cached = _content_keys.get(organization_id)
     if cached is not None and cached[0] > now:
         return cached[1]
+    return _derive_content_key(organization_id)
+
+
+def _derive_content_key(organization_id: str) -> bytes:
     value = _mac(f"saturn-org-content-v2\n{organization_id}".encode())
-    _content_keys[organization_id] = (now + _CONTENT_TTL_SECONDS, value)
+    with _cache_lock:
+        _content_keys[organization_id] = (time.monotonic() + _CONTENT_TTL_SECONDS, value)
     return value
 
 
 async def content_key_async(organization_id: str) -> bytes:
     return await asyncio.to_thread(content_key, organization_id)
+
+
+async def warm_content_key(organization_id: str) -> None:
+    """Have the organization's content key cached before a request starts sealing with it.
+
+    Sealing, opening and digests read the key synchronously, in many places. A KMS call made
+    there would hold the event loop, and every other request, for as long as KMS takes. Calling
+    this once where the request learns its organization moves that wait onto a worker thread;
+    the synchronous readers then find the key in the cache. A failure is left for the code that
+    needs the key to report.
+    """
+    if not organization_id:
+        return
+    with _cache_lock:
+        cached = _content_keys.get(organization_id)
+    if cached is not None and cached[0] > time.monotonic() + _WARM_MARGIN_SECONDS:
+        return
+    try:
+        await asyncio.to_thread(_derive_content_key, organization_id)
+    except Exception as exc:
+        logger.warning("content key not warmed: %s", type(exc).__name__)
 
 
 async def open_secret_async(token: str, organization_id: str, user_id: str = "", context: str | None = None) -> str:
@@ -154,11 +202,15 @@ def unbound_secrets_allowed() -> bool:
 
 def _private(organization_id: str, user_id: str) -> MLKEM1024PrivateKey:
     cache_key = ("mlkem", organization_id, user_id)
-    found = _keys.get(cache_key)
-    if found is None:
-        found = MLKEM1024PrivateKey.from_seed_bytes(mlkem_seed(organization_id, user_id))
+    with _cache_lock:
+        found = _keys.get(cache_key)
+    if found is not None:
+        return found
+    # Two threads may both derive the same key; the result is identical, so the second one wins harmlessly.
+    found = MLKEM1024PrivateKey.from_seed_bytes(mlkem_seed(organization_id, user_id))
+    with _cache_lock:
         # Bounded, oldest first out, so a process never holds every tenant's key it has ever used.
-        while len(_keys) >= _MAX_CACHED_KEYS:
+        while len(_keys) >= _MAX_CACHED_KEYS and cache_key not in _keys:
             _keys.pop(next(iter(_keys)))
         _keys[cache_key] = found
     return found
@@ -178,7 +230,10 @@ def seal(plain: str, organization_id: str, user_id: str = "", context: str = "")
 
 
 def open_secret(token: str, organization_id: str, user_id: str = "", context: str | None = None) -> str:
-    """Open a sealed value. Pass the context the caller expects; a value sealed for another refuses."""
+    """Open a sealed value. Pass the context the caller expects; a value sealed for another refuses.
+
+    SecretNeedsReconnect means the stored value is no good. KeyUnavailable means try again later.
+    """
     if not token or not organization_id:
         return ""
     bound = split_bound(token)
@@ -195,10 +250,15 @@ def open_secret(token: str, organization_id: str, user_id: str = "", context: st
             raise SecretNeedsReconnect()
         blob, aad = token[len(_PREFIX) :], None
     try:
+        private = _private(organization_id, user_id)
+    except Exception as exc:
+        logger.warning("tenant key unavailable: %s", type(exc).__name__)
+        raise KeyUnavailable() from exc
+    try:
         raw = base64.b64decode(blob)
         kem_ciphertext, rest = raw[:1568], raw[1568:]
         nonce, encrypted = rest[:12], rest[12:]
-        shared = _private(organization_id, user_id).decapsulate(kem_ciphertext)
+        shared = private.decapsulate(kem_ciphertext)
         key = _hkdf(shared, _INFO_AES, 32)
         return AESGCM(key).decrypt(nonce, encrypted, aad).decode()
     except SecretNeedsReconnect:

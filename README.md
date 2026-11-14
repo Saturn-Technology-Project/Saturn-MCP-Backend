@@ -133,7 +133,7 @@ Set `SEED_USER_EMAIL` and `SEED_USER_PASSWORD` in `.env` before the first boot. 
 
 - API: http://localhost:8000
 - Docs: http://localhost:8000/docs (closed on Cloud Run, or anywhere with `EXPOSE_API_DOCS=false`)
-- Health: `GET /health` (API and database status) and `GET /healthz` (up or down only)
+- Health: `GET /health` answers `{"status":"ok"}` while the process is serving and checks nothing else, so a probe never fails because a dependency does. `GET /status` reports each service (API, database, and Redis when it is used); it always answers 200 and the result is in the body, reused for five seconds. `GET /status/history` returns each service's uptime per day for the last 90 days: the worker checks every service once a minute (the API through its public address) and counts the result into that day's row in `status_days`. The console's public `/status` page draws both
 - Postgres: 127.0.0.1:5433 (user `saturn`, password `POSTGRES_PASSWORD`)
 - Redis: 127.0.0.1:6379 (password `REDIS_PASSWORD`)
 
@@ -305,7 +305,7 @@ Read directly from the process environment:
 | `PUBLIC_WS_URL` | the request's base URL locally; required on Cloud Run | Public origin for OAuth metadata, links and callbacks (`wss://` and `ws://` map to `https://` and `http://`) |
 | `SATURN_GITHUB_OAUTH_CLIENT_ID` / `_SECRET` | unset | OAuth app for GitHub's MCP server |
 | `SATURN_GOOGLE_OAUTH_CLIENT_ID` / `_SECRET` | unset | OAuth client for Google's MCP servers |
-| `ORIGIN_AUTH_SECRET` | unset | Shared secret every request except `/healthz` must carry; required on Cloud Run |
+| `ORIGIN_AUTH_SECRET` | unset | Shared secret every request except `/health` must carry; required on Cloud Run |
 | `ORIGIN_AUTH_SECRET_PREVIOUS` | unset | Also accepted during a rotation |
 | `CONSOLE_PROXY_SECRET` | unset | Shared with the console; with it the API keys rate limits on the browser address the console forwards (`X-Saturn-Client-IP`) |
 | `CONSOLE_PROXY_SECRET_PREVIOUS` | unset | Also accepted during a rotation |
@@ -346,7 +346,7 @@ Changes to the rules are recorded too: creating, editing, activating, pausing or
 ### Network exposure
 
 - **Outbound.** MCP endpoints and every URL their OAuth metadata names must be HTTPS on port 443, without credentials, not an IP literal or a metadata host, and resolve only to public addresses. MCP endpoints must also be on the allowlist. Webhook destinations are HTTPS on the standard port.
-- **Inbound.** On Cloud Run every request except `/healthz` must carry `ORIGIN_AUTH_SECRET`, so only the edge proxy can reach the service. `/healthz` reports only up or down.
+- **Inbound.** On Cloud Run every request except `/health` must carry `ORIGIN_AUTH_SECRET`, so only the edge proxy can reach the service. `/health` says only that the process is up. (`/healthz` is the same route under its older name; Cloud Run reserves that path and never passes it on.)
 - **Client addresses.** uvicorn does not trust `X-Forwarded-*` from any peer but 127.0.0.1. Rate limits use `CF-Connecting-IP` only when origin auth proves the request came through Cloudflare, otherwise the rightmost `X-Forwarded-For` entry.
 - **Rate limits** are counted in Redis and fail closed: if Redis cannot be reached, limited routes refuse the request.
 - **Request size.** A request body over 4 MiB is refused, and over 64 KiB on the sign-in and OAuth routes, before any handler reads it.
@@ -366,7 +366,7 @@ pytest
 
 Tests run against in-memory SQLite with `IN_PROCESS_RUNTIME=true` and a fixed local vault key, so they need no Postgres, Redis, KMS or network. Pytest loads a local catalog fixture (`tests/catalog.py`) so the execution-loop tests do not depend on production seed data. DNS for MCP endpoints is stubbed to a public address.
 
-The [Test workflow](.github/workflows/test.yml) runs on every push to `main` and every pull request: gitleaks over the tree and the full history (the binary checked against a pinned SHA-256), then the hashed install, `ruff check`, `pip-audit` on the production lock, and `pytest`. A second job applies every migration to PostgreSQL 16, then reverses and reapplies the newest one.
+The [Test workflow](.github/workflows/test.yml) runs on every push to `main` and every pull request: gitleaks over the tree and the full history (the binary checked against a pinned SHA-256), then the hashed install, `ruff check`, `pip-audit` on the production lock, and `pytest`. A second job applies every migration to PostgreSQL 16, then reverses and reapplies the newest one. A third builds the production image and imports the application inside it, without pushing anything. How migrations are written is in [`docs/migrations.md`](docs/migrations.md).
 
 ## Dependencies and supply chain
 

@@ -165,3 +165,42 @@ async def test_startup_lists_agents_without_changing_them(client):
         await generator.aclose()
     assert after == before
     assert isinstance(found, list)
+
+
+@pytest.mark.asyncio
+async def test_the_startup_report_names_only_agents_no_active_policy_covers(client):
+    from app.core.ids import new_id
+    from app.models import Organization, Policy
+
+    generator, session = await _db_session()
+    try:
+        for org in ("org_cov_a", "org_cov_b", "org_cov_c"):
+            session.add(Organization(id=org, name=org, plan="team", kind="organization"))
+        await session.flush()
+
+        def agent(org, name):
+            item = Agent(id=f"agent_{org}_{name}", organization_id=org, name=name)
+            session.add(item)
+            return item
+
+        def policy(org, status, agents=()):
+            item = Policy(id=new_id("pol"), organization_id=org, name="p", status=status)
+            item.agents = list(agents)
+            session.add(item)
+
+        # A: one active policy assigned to "named" only. "other" is left out.
+        named, _other = agent("org_cov_a", "named"), agent("org_cov_a", "other")
+        policy("org_cov_a", "active", [named])
+        # B: an active policy with no agents covers everyone in B.
+        agent("org_cov_b", "one")
+        policy("org_cov_b", "active")
+        # C: only a paused policy, which covers nobody.
+        agent("org_cov_c", "one")
+        policy("org_cov_c", "paused")
+        await session.commit()
+
+        found = await log_agents_without_policy(session)
+    finally:
+        await generator.aclose()
+    ours = sorted(item for item in found if item.startswith("org_cov_"))
+    assert ours == ["org_cov_a:agent_org_cov_a_other", "org_cov_c:agent_org_cov_c_one"]

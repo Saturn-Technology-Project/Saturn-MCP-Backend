@@ -129,10 +129,10 @@ async def test_root_does_not_advertise_the_build(client):
 
 @pytest.mark.asyncio
 async def test_register_is_rate_limited(client, monkeypatch):
-    monkeypatch.setattr(
-        "app.features.identity.oauth.controllers.oauth.registration_allowed",
-        lambda _request: False,
-    )
+    async def refuse(_request):
+        return False
+
+    monkeypatch.setattr("app.features.identity.oauth.controllers.oauth.registration_allowed", refuse)
     response = await client.post(
         "/oauth/register",
         json={"redirect_uris": ["http://127.0.0.1:8765/callback"]},

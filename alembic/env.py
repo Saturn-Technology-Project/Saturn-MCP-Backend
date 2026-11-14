@@ -40,27 +40,44 @@ _MIGRATION_LOCK_WAIT = os.environ.get("MIGRATION_LOCK_WAIT", "300s")
 _DDL_LOCK_TIMEOUT = "60s"
 
 
-def _serialise_postgres(connection: Connection) -> None:
-    """Run inside the migration transaction so the lock is released by its commit or rollback.
+def _serialise_postgres(connection: Connection) -> bool:
+    """Take the migration lock for this connection. True when it was taken and must be released.
 
     Concurrent runners (a Cloud Run Job retry, or several containers that still
     migrate on start) queue on the advisory lock. The next one then reads the
     new alembic_version and has nothing to do. Live connections are never
     terminated: if a request holds a lock longer than the DDL lock timeout, the
     migration fails and can be retried, instead of breaking traffic.
+
+    The lock and the timeouts belong to the session, not to one transaction, because each
+    migration now commits on its own (see docs/migrations.md).
     """
     if connection.dialect.name != "postgresql":
-        return
-    connection.execute(text("SELECT set_config('lock_timeout', :value, true)"), {"value": _MIGRATION_LOCK_WAIT})
-    connection.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _MIGRATION_LOCK_KEY})
-    connection.execute(text("SELECT set_config('lock_timeout', :value, true)"), {"value": _DDL_LOCK_TIMEOUT})
+        return False
+    connection.execute(text("SELECT set_config('lock_timeout', :value, false)"), {"value": _MIGRATION_LOCK_WAIT})
+    connection.execute(text("SELECT pg_advisory_lock(:key)"), {"key": _MIGRATION_LOCK_KEY})
+    connection.execute(text("SELECT set_config('lock_timeout', :value, false)"), {"value": _DDL_LOCK_TIMEOUT})
+    # End the transaction these statements opened. Alembic only manages transactions itself
+    # when it is handed a connection that is not already inside one.
+    connection.commit()
+    return True
 
 
 def do_run_migrations(connection: Connection) -> None:
-    context.configure(connection=connection, target_metadata=target_metadata)
-    with context.begin_transaction():
-        _serialise_postgres(connection)
-        context.run_migrations()
+    locked = _serialise_postgres(connection)
+    try:
+        # One transaction per migration, not one around the whole run: a migration can then leave
+        # its transaction (op.get_context().autocommit_block()) for CREATE INDEX CONCURRENTLY,
+        # and a long run does not hold every lock it took until the last migration finishes.
+        context.configure(connection=connection, target_metadata=target_metadata, transaction_per_migration=True)
+        with context.begin_transaction():
+            context.run_migrations()
+    finally:
+        if locked:
+            if connection.in_transaction():
+                connection.rollback()
+            connection.execute(text("SELECT pg_advisory_unlock(:key)"), {"key": _MIGRATION_LOCK_KEY})
+            connection.commit()
 
 
 async def run_async_migrations() -> None:

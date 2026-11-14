@@ -23,7 +23,7 @@ from app.models import (
     Tool,
     User,
 )
-from app.core.enums import ActorType
+from app.core.enums import ActorType, AuditEvent
 from app.features.organization.org.services.access import permissions_for_role, resolve_permissions
 from app.features.execution.activity.services.audit_service import audit_service
 from app.features.identity.auth.services.auth_service import hash_password
@@ -322,11 +322,11 @@ class AdminService:
         if changed:
             await audit_service.log(
                 session,
-                event="org_updated",
+                event=AuditEvent.ORG_UPDATED,
                 actor_type=ActorType.USER,
                 actor_id=actor.id,
                 organization_id=org.id,
-                payload=changed,
+                payload={**changed, "platform_admin": True},
             )
         return org
 
@@ -710,11 +710,16 @@ class AdminService:
         if actor is not None:
             await audit_service.log(
                 session,
-                event="member_created",
+                event=AuditEvent.MEMBER_CREATED,
                 actor_type=ActorType.USER,
                 actor_id=actor.id,
                 organization_id=organization.id,
-                payload={"email": created.user.email if created.user else normalized, "role": created.role},
+                payload={
+                    "employee_id": created.id,
+                    "email": created.user.email if created.user else normalized,
+                    "role": created.role,
+                    "platform_admin": True,
+                },
             )
         return created
 

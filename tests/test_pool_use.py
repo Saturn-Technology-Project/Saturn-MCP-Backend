@@ -105,3 +105,50 @@ async def test_a_listening_stream_gives_its_connection_back_first(monkeypatch):
     order.append("stream returned")
     assert order == ["commit", "close", "stream returned"]
     assert response.media_type == "text/event-stream"
+
+
+async def test_a_stream_that_ends_leaves_the_session_and_pings_while_silent(client, monkeypatch):
+    """The platform ends every stream at its time limit. The client reopens it with the same session."""
+    import asyncio
+
+    from app.features.mcp.saturn.controllers import saturn_mcp as controller
+    from tests.oauth_access import oauth_tokens
+
+    access, _refresh_token, client_id = await oauth_tokens(client, "Stream Agent")
+    headers = {"Authorization": f"Bearer {access}"}
+    started = await client.post(
+        "/mcp",
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05", "capabilities": {}}},
+    )
+    assert started.status_code == 200, started.text
+    session_id = started.headers["mcp-session-id"]
+    me = (await client.get("/auth/me")).json()["id"]
+    record = await controller.mcp_sessions.get(session_id, me, client_id)
+    assert record is not None
+
+    monkeypatch.setattr(controller, "STREAM_PING_SECONDS", 0.01)
+
+    class Session:
+        async def commit(self):
+            return None
+
+        async def close(self):
+            return None
+
+    async def caller(_request, _session):
+        return SimpleNamespace(id=me), "Stream Agent", client_id
+
+    with monkeypatch.context() as patched:
+        patched.setattr(controller, "_caller", caller)
+        response = await controller.saturn_mcp_listen(SimpleNamespace(headers={"mcp-session-id": session_id}), Session())
+    stream = response.body_iterator
+    assert await anext(stream) == ": connected\n\n"
+    assert await anext(stream) == ": ping\n\n"
+    await controller.mcp_sessions.notify([record.agent_id] if record.agent_id else [])
+    # The stream is cut off, the way a request time limit cuts it.
+    await stream.aclose()
+    await asyncio.sleep(0)
+    assert await controller.mcp_sessions.get(session_id, me, client_id) is not None
+    again = await client.post("/mcp", headers={**headers, "Mcp-Session-Id": session_id}, json={"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
+    assert again.status_code == 200 and "result" in again.json(), again.text

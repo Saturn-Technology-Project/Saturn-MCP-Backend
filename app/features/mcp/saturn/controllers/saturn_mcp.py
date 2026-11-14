@@ -1,4 +1,5 @@
 
+import asyncio
 import json
 import secrets
 
@@ -56,6 +57,8 @@ async def _caller(request: Request, session: SessionDep) -> tuple[User, str, str
 
 MAX_MCP_BODY_BYTES = 256 * 1024
 MCP_CALLS_PER_MINUTE = 600
+# How often a silent event stream sends a comment line, so no proxy takes it for dead.
+STREAM_PING_SECONDS = 25.0
 
 
 async def _read_capped(request: Request) -> bytes | None:
@@ -79,8 +82,11 @@ async def saturn_mcp_endpoint(request: Request, session: SessionDep) -> JSONResp
         raise
     org = user.organization or await session.get(Organization, user.organization_id)
     from app.core.rate_limit import allow
+    from app.features.credentials.vault.services.pq_crypto import warm_content_key
 
-    if not allow(f"mcp:{user.id}:{client_id}", limit=MCP_CALLS_PER_MINUTE, window=60):
+    await warm_content_key(user.organization_id)
+
+    if not await allow(f"mcp:{user.id}:{client_id}", limit=MCP_CALLS_PER_MINUTE, window=60):
         return JSONResponse(
             rpc_error(None, -32029, "Too many requests"),
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -147,15 +153,19 @@ async def saturn_mcp_listen(request: Request, session: SessionDep) -> StreamingR
         try:
             yield ": connected\n\n"
             while True:
-                if record.queue.empty():
-                    note = await record.queue.get()
-                else:
-                    note = record.queue.get_nowait()
+                try:
+                    note = await asyncio.wait_for(record.queue.get(), STREAM_PING_SECONDS)
+                except asyncio.TimeoutError:
+                    # A comment line. Proxies end a stream that stays silent (Cloudflare after 100 s).
+                    yield ": ping\n\n"
+                    continue
                 if note is None:
                     return
                 yield f"event: message\ndata: {json.dumps(note, separators=(',', ':'))}\n\n"
         finally:
-            await mcp_sessions.close(session_id)
+            # Only the stream ends here. The platform cuts every request off at its time limit,
+            # and ending the session with it made each client initialize again that often.
+            await mcp_sessions.detach(session_id)
 
     return StreamingResponse(
         events(),

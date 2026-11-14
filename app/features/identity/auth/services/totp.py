@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -19,6 +20,7 @@ from app.features.identity.auth.services.attempts import reserve_attempt
 from app.core.ids import new_id, utcnow
 from app.core.rate_limit import _redis_client, _use_redis
 from app.features.credentials.vault.services.credential_service import open_secret, seal
+from app.features.credentials.vault.services.pq_crypto import SecretNeedsReconnect
 from app.features.identity.auth.models.mfa import TotpBackupCode
 from app.features.identity.auth.models.user import User
 
@@ -63,7 +65,7 @@ def _matched_step(secret_b32: str, code: str, now: float | None = None) -> int |
     return matched_step
 
 
-def _claim_step(secret_b32: str, step: int) -> bool:
+async def _claim_step(secret_b32: str, step: int) -> bool:
     fp = hashlib.sha256(secret_b32.strip().upper().encode()).hexdigest()
     last = _used_steps.get(fp, 0)
     if step <= last:
@@ -71,19 +73,19 @@ def _claim_step(secret_b32: str, step: int) -> bool:
     if _use_redis():
         try:
             client = _redis_client()
-            prev = client.get(f"saturn:totp:last:{fp}")
+            prev = await client.get(f"saturn:totp:last:{fp}")
             if prev is not None and step <= int(prev):
                 return False
-            if not client.set(f"saturn:totp:used:{fp}:{step}", "1", nx=True, ex=_WINDOW_SECONDS):
+            if not await client.set(f"saturn:totp:used:{fp}:{step}", "1", nx=True, ex=_WINDOW_SECONDS):
                 return False
-            client.set(f"saturn:totp:last:{fp}", str(step), ex=_WINDOW_SECONDS)
+            await client.set(f"saturn:totp:last:{fp}", str(step), ex=_WINDOW_SECONDS)
         except Exception:
             return False
     _used_steps[fp] = step
     return True
 
 
-def verify_code(
+async def verify_code(
     secret_b32: str,
     code: str,
     now: float | None = None,
@@ -93,7 +95,7 @@ def verify_code(
     step = _matched_step(secret_b32, code, now)
     if step is None or step <= last_step:
         return False
-    return _claim_step(secret_b32, step)
+    return await _claim_step(secret_b32, step)
 
 
 def hash_backup_code(code: str) -> str:
@@ -119,7 +121,7 @@ async def begin_setup(session: AsyncSession, user: User) -> dict[str, object]:
         raise HTTPException(status.HTTP_409_CONFLICT, "MFA is already enabled")
     raw = secrets.token_bytes(20)
     secret_b32 = base64.b32encode(raw).decode().rstrip("=")
-    user.totp_secret = seal(secret_b32, user.organization_id, user.id)
+    user.totp_secret = await asyncio.to_thread(seal, secret_b32, user.organization_id, user.id)
     user.totp_enabled = False
     user.totp_attempts = 0
     user.totp_last_step = 0
@@ -155,8 +157,8 @@ async def confirm_setup(
         await session.flush()
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many failed attempts")
     try:
-        secret_b32 = open_secret(user.totp_secret, user.organization_id, user.id)
-    except Exception as exc:
+        secret_b32 = await asyncio.to_thread(open_secret, user.totp_secret, user.organization_id, user.id)
+    except SecretNeedsReconnect as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, "MFA setup needs to be started again") from exc
     used = await reserve_attempt(session, user, "totp_attempts", MAX_ATTEMPTS)
     if used is None:
@@ -165,7 +167,7 @@ async def confirm_setup(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many failed attempts")
     last_step = int(user.totp_last_step or 0)
     step = _matched_step(secret_b32, code, now) if secret_b32 else None
-    if step is None or step <= last_step or not _claim_step(secret_b32, step):
+    if step is None or step <= last_step or not await _claim_step(secret_b32, step):
         if used >= MAX_ATTEMPTS:
             user.totp_secret = ""
             await session.flush()
@@ -190,8 +192,8 @@ async def verify_user_totp(
     if _locked(user):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many failed attempts")
     try:
-        secret_b32 = open_secret(user.totp_secret, user.organization_id, user.id)
-    except Exception as exc:
+        secret_b32 = await asyncio.to_thread(open_secret, user.totp_secret, user.organization_id, user.id)
+    except SecretNeedsReconnect as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, "MFA needs to be set up again") from exc
     used = await reserve_attempt(session, user, "totp_attempts", MAX_ATTEMPTS)
     if used is None:
@@ -201,7 +203,7 @@ async def verify_user_totp(
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many failed attempts")
     last_step = int(user.totp_last_step or 0)
     step = _matched_step(secret_b32, code, now) if secret_b32 else None
-    if step is not None and step > last_step and _claim_step(secret_b32, step):
+    if step is not None and step > last_step and await _claim_step(secret_b32, step):
         user.totp_last_step = step
         user.totp_attempts = 0
         user.totp_locked_until = None

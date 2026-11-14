@@ -9,6 +9,10 @@ from app.features.identity.auth.controllers.deps import ActorDep, ApprovalsRead,
 from app.schemas import ApprovalDecisionRead, ApprovalRead, ApprovalRequirementProgress
 from app.features.execution.approvals.services.approval_service import approval_service
 
+# The body carries the arguments of one tool call, which the agent could only submit through
+# /mcp within that endpoint's own limit. Twice that leaves room for the JSON around them.
+MAX_APPROVE_BODY_BYTES = 512 * 1024
+
 router = APIRouter(prefix="/approvals", tags=["approvals"])
 
 
@@ -16,21 +20,20 @@ async def serialize_approval(session, approval) -> ApprovalRead:
     amount = approval.requested_amount
     decisions = list(getattr(approval, "decisions", None) or [])
     approved_count = sum(1 for item in decisions if item.decision == "approved")
-    status = approval.status.value if hasattr(approval.status, "value") else approval.status
     progress = await approval_service.requirement_progress(session, approval)
     return ApprovalRead(
         id=approval.id,
         run_id=approval.run_id,
         action_id=approval.action_id,
-        status=status,
+        status=approval.state.value,
         requested_amount=float(amount) if amount is not None else None,
         resolved_by=approval.resolved_by,
         created_at=approval.created_at,
         resolved_at=approval.resolved_at,
-        required_count=int(approval.required_count or 1),
+        required_count=approval.votes_needed,
         approved_count=approved_count,
         requirements=[ApprovalRequirementProgress(**item) for item in progress],
-        execution_state=approval.execution_state or "none",
+        execution_state=approval.execution.value,
         expires_at=approval.expires_at,
         resubmit_expires_at=approval.resubmit_expires_at,
         expired_phase=approval.expired_phase,
@@ -67,7 +70,12 @@ async def approve(
     _access: ApprovalsWrite,
 ):
     execution_arguments = None
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_APPROVE_BODY_BYTES:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Request body is too large")
     raw = await request.body()
+    if len(raw) > MAX_APPROVE_BODY_BYTES:
+        raise HTTPException(status.HTTP_413_CONTENT_TOO_LARGE, "Request body is too large")
     if raw.strip():
         try:
             parsed = json.loads(raw)

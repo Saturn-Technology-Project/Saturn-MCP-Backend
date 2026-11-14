@@ -37,6 +37,23 @@ class ApprovalStatus(str, Enum):
     INVALIDATED = "invalidated"
 
 
+class ExecutionState(str, Enum):
+    """How far the approved call has got. An approval stays "approved" while its call runs."""
+
+    NONE = "none"
+    CLAIMED = "claimed"
+    EXECUTED = "executed"
+    UNCERTAIN = "uncertain"
+    FAILED = "failed"
+
+
+class ExpiryPhase(str, Enum):
+    """Which deadline passed: nobody decided in time, or the approved call was never sent again."""
+
+    PENDING = "pending"
+    RESUBMIT = "resubmit"
+
+
 class PolicyDecision(str, Enum):
     ALLOW = "allow"
     APPROVAL_REQUIRED = "approval_required"
@@ -80,6 +97,10 @@ class AuditEvent(str, Enum):
     TOOL_SET_ASSIGNED = "tool_set_assigned"
     MEMBER_INVITED = "member_invited"
     MEMBER_UPDATED = "member_updated"
+    # Written when a platform admin acts inside a tenant.
+    MEMBER_CREATED = "member_created"
+    MEMBER_PASSWORD_RESET = "member_password_reset"  # noqa: S105 (an event name)
+    ORG_UPDATED = "org_updated"
     INVITE_REVOKED = "invite_revoked"
     AGENT_DELETED = "agent_deleted"
     MCP_SERVER_DELETED = "mcp_server_deleted"

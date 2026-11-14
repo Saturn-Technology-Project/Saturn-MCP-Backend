@@ -3,14 +3,14 @@ import pytest
 from app.core.rate_limit import allow, client_ip
 
 
-def test_allow_blocks_after_the_limit():
+async def test_allow_blocks_after_the_limit():
     key = "test-register-limit"
-    assert allow(key, limit=2, window=60)
-    assert allow(key, limit=2, window=60)
-    assert allow(key, limit=2, window=60) is False
+    assert await allow(key, limit=2, window=60)
+    assert await allow(key, limit=2, window=60)
+    assert await allow(key, limit=2, window=60) is False
 
 
-def test_shared_limit_uses_one_redis_counter(monkeypatch):
+async def test_shared_limit_uses_one_redis_counter(monkeypatch):
     from app.core import rate_limit
 
     class Fake:
@@ -24,7 +24,7 @@ def test_shared_limit_uses_one_redis_counter(monkeypatch):
         def expire(self, key: str, window: int) -> bool:
             return True
 
-        def eval(self, _script: str, _numkeys: int, key: str, window: int) -> int:
+        async def eval(self, _script: str, _numkeys: int, key: str, window: int) -> int:
             # The limiter increments and sets the TTL in one atomic script.
             assert window == 60
             return self.incr(key)
@@ -32,8 +32,8 @@ def test_shared_limit_uses_one_redis_counter(monkeypatch):
     fake = Fake()
     monkeypatch.setattr(rate_limit, "_use_redis", lambda: True)
     monkeypatch.setattr(rate_limit, "_redis_client", lambda: fake)
-    assert rate_limit.allow("shared", limit=1, window=60)
-    assert rate_limit.allow("shared", limit=1, window=60) is False
+    assert await rate_limit.allow("shared", limit=1, window=60)
+    assert await rate_limit.allow("shared", limit=1, window=60) is False
     assert fake.values["saturn:rate:shared"] == 2
 
 
@@ -67,13 +67,13 @@ async def test_redis_outage_rejects_login_and_registration_without_memory_fallba
         def incr(self, _key: str) -> int:
             raise ConnectionError("redis unreachable")
 
-        def eval(self, *_args) -> int:
+        async def eval(self, *_args) -> int:
             raise ConnectionError("redis unreachable")
 
     monkeypatch.setattr(rate_limit, "_use_redis", lambda: True)
     monkeypatch.setattr(rate_limit, "_redis_client", lambda: DownRedis())
 
-    assert rate_limit.allow("any-key") is False
+    assert await rate_limit.allow("any-key") is False
 
     login_resp = await client.post(
         "/auth/login",
@@ -124,7 +124,7 @@ def test_throttle_uses_the_same_client_ip_as_rate_limits(monkeypatch):
     assert throttle.client_ip(Request()) == "203.0.113.8"
 
 
-def test_login_is_limited_per_account_across_addresses():
+async def test_login_is_limited_per_account_across_addresses():
     from app.core import rate_limit
 
     class Request:
@@ -135,12 +135,12 @@ def test_login_is_limited_per_account_across_addresses():
     results = []
     for n in range(12):
         # A wrong password: the slot login_allowed took is not given back.
-        results.append(rate_limit.login_allowed(Request(f"10.0.0.{n}"), "victim@example.com"))
+        results.append(await rate_limit.login_allowed(Request(f"10.0.0.{n}"), "victim@example.com"))
     assert results[:10] == [True] * 10
     assert results[10:] == [False, False]
 
 
-def test_a_burst_of_guesses_cannot_pass_the_account_limit():
+async def test_a_burst_of_guesses_cannot_pass_the_account_limit():
     from app.core import rate_limit
 
     class Request:
@@ -150,11 +150,11 @@ def test_a_burst_of_guesses_cannot_pass_the_account_limit():
 
     # Thirty requests all checked before any password has been verified. Counting failures only
     # afterwards let every one of them through.
-    in_flight = [rate_limit.login_allowed(Request(f"10.1.0.{n}"), "burst@example.com") for n in range(30)]
+    in_flight = [await rate_limit.login_allowed(Request(f"10.1.0.{n}"), "burst@example.com") for n in range(30)]
     assert in_flight.count(True) == rate_limit.LOGIN_ACCOUNT_FAILURES
 
 
-def test_successful_sign_ins_do_not_count_against_the_account():
+async def test_successful_sign_ins_do_not_count_against_the_account():
     from app.core import rate_limit
 
     class Request:
@@ -164,11 +164,11 @@ def test_successful_sign_ins_do_not_count_against_the_account():
 
     # Fifteen good sign-ins from different addresses, none of them failures.
     for n in range(15):
-        assert rate_limit.login_allowed(Request(f"10.3.0.{n}"), "busy@example.com")
-        rate_limit.login_succeeded("busy@example.com")
+        assert await rate_limit.login_allowed(Request(f"10.3.0.{n}"), "busy@example.com")
+        await rate_limit.login_succeeded("busy@example.com")
 
 
-def test_ipv6_addresses_are_counted_per_64(monkeypatch):
+async def test_ipv6_addresses_are_counted_per_64(monkeypatch):
     from app.core import rate_limit
 
     monkeypatch.delenv("ORIGIN_AUTH_SECRET", raising=False)
@@ -184,22 +184,22 @@ def test_ipv6_addresses_are_counted_per_64(monkeypatch):
     assert rate_limit.limit_address(Request("203.0.113.8")) == "203.0.113.8"
     assert rate_limit.limit_address(Request("::ffff:203.0.113.8")) == "203.0.113.8"
     # One customer rotating through their own /64 shares a single login bucket.
-    answers = [rate_limit.login_allowed(Request(f"2001:db8:9:9::{n:x}")) for n in range(1, 26)]
+    answers = [await rate_limit.login_allowed(Request(f"2001:db8:9:9::{n:x}")) for n in range(1, 26)]
     assert answers.count(True) == rate_limit.MAX_HITS
     # A different /64 is not affected.
-    assert rate_limit.login_allowed(Request("2001:db8:9:a::1")) is True
+    assert await rate_limit.login_allowed(Request("2001:db8:9:a::1")) is True
 
 
-def test_release_never_goes_below_zero_or_frees_more_than_it_took():
+async def test_release_never_goes_below_zero_or_frees_more_than_it_took():
     from app.core import rate_limit
 
-    rate_limit.release("nothing-here")
-    assert rate_limit.allow("slot", limit=1) is True
-    assert rate_limit.allow("slot", limit=1) is False
-    rate_limit.release("slot")
-    rate_limit.release("slot")
-    assert rate_limit.allow("slot", limit=1) is True
-    assert rate_limit.allow("slot", limit=1) is False
+    await rate_limit.release("nothing-here")
+    assert await rate_limit.allow("slot", limit=1) is True
+    assert await rate_limit.allow("slot", limit=1) is False
+    await rate_limit.release("slot")
+    await rate_limit.release("slot")
+    assert await rate_limit.allow("slot", limit=1) is True
+    assert await rate_limit.allow("slot", limit=1) is False
 
 
 def test_client_ip_trusts_the_console_address_only_with_the_console_secret(monkeypatch):
@@ -226,7 +226,7 @@ def test_client_ip_trusts_the_console_address_only_with_the_console_secret(monke
     assert client_ip(Request({"x-saturn-console-auth": "", "x-saturn-client-ip": "198.51.100.9"})) == "34.1.1.1"
 
 
-def test_console_users_do_not_share_one_login_bucket(monkeypatch):
+async def test_console_users_do_not_share_one_login_bucket(monkeypatch):
     from app.core import rate_limit
 
     monkeypatch.setenv("ORIGIN_AUTH_SECRET", "edge")
@@ -241,7 +241,7 @@ def test_console_users_do_not_share_one_login_bucket(monkeypatch):
             }
             self.client = None
 
-    attacker = [rate_limit.login_allowed(Request("203.0.113.66")) for _ in range(25)]
+    attacker = [await rate_limit.login_allowed(Request("203.0.113.66")) for _ in range(25)]
     assert attacker[-1] is False
     # Another browser behind the same console is not locked out.
-    assert rate_limit.login_allowed(Request("198.51.100.20")) is True
+    assert await rate_limit.login_allowed(Request("198.51.100.20")) is True

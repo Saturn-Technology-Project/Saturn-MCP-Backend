@@ -258,11 +258,11 @@ async def update_org_member(
     )
     await audit_service.log(
         session,
-        event="member_updated",
+        event=AuditEvent.MEMBER_UPDATED,
         actor_type=ActorType.USER,
         actor_id=admin.id,
         organization_id=organization_id,
-        payload={"employee_id": employee_id, "status": employee.status, "role": employee.role},
+        payload={"employee_id": employee_id, "status": employee.status, "role": employee.role, "platform_admin": True},
     )
     return serialize_member(employee)
 
@@ -285,11 +285,11 @@ async def reset_org_member_password(
     )
     await audit_service.log(
         session,
-        event="member_password_reset",
+        event=AuditEvent.MEMBER_PASSWORD_RESET,
         actor_type=ActorType.USER,
         actor_id=admin.id,
         organization_id=organization_id,
-        payload={"employee_id": employee_id, "method": "email_code"},
+        payload={"employee_id": employee_id, "method": "email_code", "platform_admin": True},
     )
     return serialize_member(employee)
 

@@ -30,6 +30,16 @@ from app.features.mcp.servers.services.mcp_remote import McpUnauthorized, list_r
 from app.features.identity.oauth.services.oauth_service import pkce_s256
 
 PENDING_TTL = timedelta(minutes=10)
+# What a refresh reads from the connection row, reloaded once the row is locked.
+_GRANT_COLUMNS = ("credential_id", "token_expires_at", "oauth_token_endpoint", "oauth_client_id", "oauth_resource")
+_refresh_locks: dict[str, asyncio.Lock] = {}
+
+
+def _refresh_lock(server_id: str) -> asyncio.Lock:
+    """One lock per connection in this process. Dropped once nobody holds or waits for it."""
+    for key in [key for key, lock in _refresh_locks.items() if key != server_id and not lock.locked()]:
+        del _refresh_locks[key]
+    return _refresh_locks.setdefault(server_id, asyncio.Lock())
 MAX_OAUTH_RESPONSE_BYTES = 256 * 1024
 BROWSER_COOKIE_PREFIX = "saturn_mcp_"
 CALLBACK_PATH = "/mcp-servers/oauth/callback"
@@ -397,9 +407,13 @@ class McpOAuth:
                 name=name,
                 endpoint=endpoint,
                 nonce=nonce,
-                verifier_ciphertext=seal(verifier, user.organization_id, user.id),
+                verifier_ciphertext=await asyncio.to_thread(seal, verifier, user.organization_id, user.id),
                 client_id=registered["client_id"],
-                client_secret_ciphertext=seal(registered["client_secret"], user.organization_id, user.id) if registered["client_secret"] else "",
+                client_secret_ciphertext=(
+                    await asyncio.to_thread(seal, registered["client_secret"], user.organization_id, user.id)
+                    if registered["client_secret"]
+                    else ""
+                ),
                 token_endpoint=found.token_endpoint,
                 resource=found.resource,
                 scope=found.scope,
@@ -517,8 +531,12 @@ class McpOAuth:
         from app.features.credentials.vault.services.pq_crypto import SecretNeedsReconnect
 
         try:
-            verifier = open_secret(pending.verifier_ciphertext, pending.organization_id, pending.user_id)
-            secret = open_secret(pending.client_secret_ciphertext, pending.organization_id, pending.user_id) if pending.client_secret_ciphertext else ""
+            verifier = await asyncio.to_thread(open_secret, pending.verifier_ciphertext, pending.organization_id, pending.user_id)
+            secret = (
+                await asyncio.to_thread(open_secret, pending.client_secret_ciphertext, pending.organization_id, pending.user_id)
+                if pending.client_secret_ciphertext
+                else ""
+            )
         except SecretNeedsReconnect:
             return _page(False, nonce, "This sign-in expired. Close the window and connect again.")
         try:
@@ -591,25 +609,49 @@ class McpOAuth:
         secret = grant["access_token"]
         expires = server.token_expires_at
         if expires is not None and _aware(expires) <= utcnow() + timedelta(seconds=60):
-            refreshed = await self._refresh(session, server)
+            refreshed = await self._refresh(session, server, used=secret)
             if refreshed:
                 return refreshed
         if secret:
             await self._audit_open(session, server, "upstream_mcp")
         return secret
 
-    async def refresh_after_reject(self, session: AsyncSession, server: McpServer | None) -> str:
+    async def refresh_after_reject(self, session: AsyncSession, server: McpServer | None, rejected: str = "") -> str:
+        """A new access token after the upstream refused `rejected`."""
         if server is None:
             return ""
-        return await self._refresh(session, server)
+        return await self._refresh(session, server, used=rejected)
 
-    async def _refresh(self, session: AsyncSession, server: McpServer) -> str:
+    async def _refresh(self, session: AsyncSession, server: McpServer, *, used: str = "") -> str:
+        """Exchange the refresh token, one caller at a time per connection.
+
+        A provider that rotates refresh tokens revokes the grant when an old one is presented
+        again, so two calls refreshing at once could leave the connection signed out. The second
+        caller waits, then takes the token the first one stored. The new tokens are committed
+        before this returns: the provider has already retired the old ones, and a request that
+        failed afterwards would otherwise roll the only valid refresh token away.
+        """
         from app.features.credentials.vault.services.pq_crypto import SecretNeedsReconnect
 
-        try:
-            grant = await read_grant(session, server)
-        except SecretNeedsReconnect as exc:
-            raise HTTPException(status.HTTP_409_CONFLICT, "This connection needs to be signed in again") from exc
+        async with _refresh_lock(server.id):
+            # Other processes: the row lock makes them wait here, and the reload shows what they stored.
+            await session.refresh(server, attribute_names=_GRANT_COLUMNS, with_for_update=True)
+            try:
+                grant = await read_grant(session, server, fresh=True)
+            except SecretNeedsReconnect as exc:
+                await session.commit()
+                raise HTTPException(status.HTTP_409_CONFLICT, "This connection needs to be signed in again") from exc
+            current = grant["access_token"]
+            if used and current and current != used:
+                await self._audit_open(session, server, "upstream_mcp")
+                await session.commit()
+                return current
+            access = await self._exchange_refresh(session, server, grant)
+            # Also on failure: it releases the row for the next caller.
+            await session.commit()
+            return access
+
+    async def _exchange_refresh(self, session: AsyncSession, server: McpServer, grant: dict[str, str]) -> str:
         refresh = grant["refresh_token"]
         if not refresh or not server.oauth_token_endpoint or not server.oauth_client_id:
             return ""

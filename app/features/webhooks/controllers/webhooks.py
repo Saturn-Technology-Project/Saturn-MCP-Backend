@@ -198,7 +198,7 @@ async def post_test(endpoint_id: str, session: SessionDep, member: TeamWrite, _p
 
     # A test is a signed POST to an address the organization chose, retried like any delivery.
     # Without a limit it is a way to send traffic at someone else's server.
-    if not allow(f"webhook-test:{member.organization_id}", limit=30, window=600):
+    if not await allow(f"webhook-test:{member.organization_id}", limit=30, window=600):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many test deliveries", headers={"Retry-After": "600"})
     row = await send_test(session, member.organization_id, endpoint_id)
     return _delivery_read(row)
@@ -215,7 +215,7 @@ async def post_retry(delivery_id: str, session: SessionDep, member: TeamWrite, _
     from app.core.rate_limit import allow
 
     # Each retry restarts the attempt count, so it is limited rather than repeatable at will.
-    if not allow(f"webhook-retry:{member.organization_id}", limit=30, window=600):
+    if not await allow(f"webhook-retry:{member.organization_id}", limit=30, window=600):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many retries", headers={"Retry-After": "600"})
     row = await retry_delivery(session, member.organization_id, delivery_id)
     return _delivery_read(row)

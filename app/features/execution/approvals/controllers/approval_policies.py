@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.features.execution.approvals.models.approval import ApprovalPolicy
 from app.features.execution.approvals.services.approval_policy_service import approval_policy_service
@@ -16,6 +16,10 @@ from app.features.identity.auth.controllers.deps import (
 router = APIRouter(prefix="/org/approval-policies", tags=["approval-policies"])
 
 
+# Groups one approval policy may name. Far above any real policy; it bounds the request.
+MAX_REQUIREMENTS = 50
+
+
 class ApprovalRequirementRead(BaseModel):
     group_id: str
     group_name: str = ""
@@ -23,7 +27,7 @@ class ApprovalRequirementRead(BaseModel):
 
 
 class ApprovalRequirementWrite(BaseModel):
-    group_id: str
+    group_id: str = Field(max_length=64)
     required_count: int = 1
 
 
@@ -41,21 +45,22 @@ class ApprovalPolicyRead(BaseModel):
 
 
 class ApprovalPolicyWrite(BaseModel):
-    name: str
+    # The column holds 255 characters. Longer names used to reach the database and fail there.
+    name: str = Field(max_length=255)
     required_count: int = 1
-    group_id: str | None = None
-    requirements: list[ApprovalRequirementWrite] | None = None
+    group_id: str | None = Field(default=None, max_length=64)
+    requirements: list[ApprovalRequirementWrite] | None = Field(default=None, max_length=MAX_REQUIREMENTS)
     allow_requester: bool = False
     expires_minutes: int | None = None
     resubmit_minutes: int | None = None
 
 
 class ApprovalPolicyUpdate(BaseModel):
-    name: str | None = None
-    status: str | None = None
+    name: str | None = Field(default=None, max_length=255)
+    status: str | None = Field(default=None, max_length=32)
     required_count: int | None = None
-    group_id: str | None = None
-    requirements: list[ApprovalRequirementWrite] | None = None
+    group_id: str | None = Field(default=None, max_length=64)
+    requirements: list[ApprovalRequirementWrite] | None = Field(default=None, max_length=MAX_REQUIREMENTS)
     clear_group: bool = False
     allow_requester: bool | None = None
     expires_minutes: int | None = None

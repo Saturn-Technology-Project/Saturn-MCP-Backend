@@ -187,3 +187,97 @@ def test_ipv6_forms_that_carry_an_internal_ipv4_are_blocked():
         assert address_blocked(value), value
     assert not address_blocked("2606:4700:4700::1111")
     assert not address_blocked("1.1.1.1")
+
+
+def test_site_local_ipv6_and_the_azure_wire_server_are_blocked():
+    from app.features.mcp.servers.services.mcp_endpoint import address_blocked
+
+    assert address_blocked("fec0::1")
+    assert address_blocked("feff:ffff::1")
+    assert address_blocked("168.63.129.16")
+    assert not address_blocked("168.63.129.17")
+    assert not address_blocked("2606:4700:4700::1111")
+
+
+def test_credentials_under_other_parameter_names_leave_the_endpoint_too():
+    from app.features.mcp.servers.services.mcp_endpoint import split_url_credential
+    from app.features.mcp.servers.services.mcp_remote import redact_url
+    from app.schemas import McpServerRead
+
+    for name in ("x-api-key", "X_API_KEY", "subscription-key", "id_token", "client.secret", "x-auth", "passwd"):
+        url = f"https://api.sec-api.io/mcp?{name}=sk-live-1234567890&region=us"
+        assert split_url_credential(url) == ("https://api.sec-api.io/mcp?region=us", "sk-live-1234567890"), name
+        # An endpoint stored before this name was covered is still never shown with its key.
+        assert redact_url(url) == f"https://api.sec-api.io/mcp?{name}=***&region=us", name
+        assert "sk-live" not in McpServerRead(id="s", name="n", endpoint=url, status="active").endpoint
+    # Ordinary parameters stay where they are.
+    plain = "https://api.sec-api.io/mcp?region=us&keyword=filings&page=2"
+    assert split_url_credential(plain) == (plain, "")
+    assert redact_url(plain) == plain
+
+
+def _mock_upstream(monkeypatch, handler):
+    import httpx
+
+    built = []
+    real = httpx.AsyncClient
+
+    def build(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        client = real(*args, **kwargs)
+        built.append(client)
+        return client
+
+    monkeypatch.setattr("app.features.mcp.servers.services.mcp_remote.httpx.AsyncClient", build)
+    return built
+
+
+@pytest.mark.asyncio
+async def test_upstream_calls_reuse_one_client_per_host_and_never_share_across_hosts(monkeypatch):
+    import httpx
+
+    from app.features.mcp.servers.services import mcp_remote
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = __import__("json").loads(request.content)
+        result = {} if body["method"] == "initialize" else {"tools": [{"name": "t"}], "content": []}
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": result})
+
+    built = _mock_upstream(monkeypatch, handler)
+    await mcp_remote.list_remote_tools("https://mcp.notion.com/mcp", "token")
+    await mcp_remote.call_remote_tool("https://mcp.notion.com/mcp", "t", {}, "token")
+    assert len(built) == 1
+    # Both names resolve to the same test address. A shared pool would reuse the connection whose
+    # certificate was checked for the first name.
+    await mcp_remote.list_remote_tools("https://mcp.linear.app/mcp", "token")
+    assert len(built) == 2 and set(mcp_remote._clients) == {"mcp.notion.com", "mcp.linear.app"}
+    await mcp_remote.close_clients()
+    assert all(client.is_closed for client in built) and not mcp_remote._clients
+
+
+@pytest.mark.asyncio
+async def test_a_dead_kept_connection_retries_initialize_but_never_a_tool_call(monkeypatch):
+    import httpx
+
+    from app.features.mcp.servers.services import mcp_remote
+
+    seen: list[str] = []
+    fail = {"initialize": 1, "tools/call": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = __import__("json").loads(request.content)
+        seen.append(body["method"])
+        if fail[body["method"]] > 0:
+            fail[body["method"]] -= 1
+            raise httpx.RemoteProtocolError("Server disconnected without sending a response.", request=request)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": {"content": []}})
+
+    _mock_upstream(monkeypatch, handler)
+    assert "result" in await mcp_remote.call_remote_tool("https://mcp.notion.com/mcp", "t", {}, "token")
+    assert seen == ["initialize", "initialize", "tools/call"]
+
+    seen.clear()
+    fail["tools/call"] = 1
+    with pytest.raises(mcp_remote.McpTimeout):
+        await mcp_remote.call_remote_tool("https://mcp.notion.com/mcp", "t", {}, "token")
+    assert seen == ["initialize", "tools/call"]

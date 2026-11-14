@@ -42,11 +42,19 @@ class MappingService:
             raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Failed to map employee")
         return employee
 
-    async def bind_workspace(self, session: AsyncSession, user: User) -> Employee | None:
+    async def bind_workspace(self, session: AsyncSession, user: User, *, links: bool = True) -> Employee | None:
+        """Make sure the member exists and has their first server assignments.
+
+        With links=False the gateway's view of the organization's servers is left alone once the
+        member is set up. /auth/me runs on every page load and shows no connection state; the
+        pages that do show it bind with links on.
+        """
         employee = await self.employee_for_user(session, user.id)
         if employee is None:
             employee = await self.ensure_bootstrap_employee(session, user)
         if employee is None or employee.status != "active":
+            return employee
+        if not links and (employee.mcp_assignments_initialized or not allows(employee.permissions, "agents", "read")):
             return employee
 
         await mcp_gateway.connect_organization(session, user.organization_id)
@@ -127,6 +135,18 @@ class MappingService:
             .where(Employee.user_id == user_id)
         )
         return result.scalar_one_or_none()
+
+    async def membership_for_check(self, session: AsyncSession, user: User) -> Employee:
+        """The caller's membership row alone, for a permission check.
+
+        One query. employee_for_user also loads the member's agents, servers and every tool of
+        those servers, which a check of `permissions` never reads; that ran on each request.
+        Only columns are loaded here, so callers must not reach for the relationships.
+        """
+        employee = (await session.execute(select(Employee).where(Employee.user_id == user.id))).scalar_one_or_none()
+        if employee is None or employee.status != "active":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "No employee mapping for this user")
+        return employee
 
     async def require_employee(self, session: AsyncSession, user: User) -> Employee:
         employee = await self.employee_for_user(session, user.id)

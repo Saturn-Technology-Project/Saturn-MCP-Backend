@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.ids import new_id
 from app.models import Agent, Policy, PolicyRule, Tool
+from app.shared.models.associations import agent_policies
 
 logger = logging.getLogger(__name__)
 
@@ -98,23 +99,44 @@ async def _fill_rules(session: AsyncSession, policy: Policy) -> Policy:
     return policy
 
 
+# The report names at most this many agents. It is a hint in the log, not an inventory.
+REPORT_LIMIT = 200
+
+
 async def log_agents_without_policy(session: AsyncSession) -> list[str]:
-    """Report agents the default-deny flag would block. Does not change them."""
-    agents = list((await session.scalars(select(Agent))).all())
-    result = await session.execute(
-        select(Policy).options(selectinload(Policy.agents)).where(Policy.status == "active")
+    """Report agents the default-deny flag would block. Does not change them.
+
+    One query that returns only the uncovered agents. It used to load every tenant's agents and
+    active policies into memory on each start, which grew with the whole platform.
+    """
+    # Each subquery names what it takes from outside. Left to guess, the innermost one would
+    # select from agents again and match any agent, not the one being checked.
+    assigned_at_all = exists().where(agent_policies.c.policy_id == Policy.id).correlate(Policy)
+    assigned_here = (
+        exists()
+        .where(agent_policies.c.policy_id == Policy.id, agent_policies.c.agent_id == Agent.id)
+        .correlate(Policy, Agent)
     )
-    policies = list(result.scalars().unique().all())
-    uncovered: list[str] = []
-    for agent in agents:
-        applicable = [
-            policy
-            for policy in policies
-            if policy.organization_id == agent.organization_id
-            and (not list(policy.agents or []) or any(item.id == agent.id for item in policy.agents))
-        ]
-        if not applicable:
-            uncovered.append(f"{agent.organization_id}:{agent.id}")
+    covered = (
+        exists()
+        .where(
+            Policy.organization_id == Agent.organization_id,
+            Policy.status == "active",
+            # A policy with no agents applies to every agent of its organization.
+            or_(~assigned_at_all, assigned_here),
+        )
+        .correlate(Agent)
+    )
+    rows = (
+        await session.execute(
+            select(Agent.organization_id, Agent.id)
+            .where(~covered)
+            .order_by(Agent.organization_id, Agent.id)
+            .limit(REPORT_LIMIT + 1)
+        )
+    ).all()
+    uncovered = [f"{organization_id}:{agent_id}" for organization_id, agent_id in rows[:REPORT_LIMIT]]
     if uncovered:
-        logger.warning("agents with no applicable policy: %s", ", ".join(sorted(uncovered)))
+        more = " (and more)" if len(rows) > REPORT_LIMIT else ""
+        logger.warning("agents with no applicable policy: %s%s", ", ".join(uncovered), more)
     return uncovered

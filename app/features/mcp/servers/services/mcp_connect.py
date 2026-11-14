@@ -122,7 +122,7 @@ class McpConnectService:
         try:
             discovered = await list_remote_tools(url, secret)
         except McpUnauthorized:
-            secret = await mcp_oauth.refresh_after_reject(session, server)
+            secret = await mcp_oauth.refresh_after_reject(session, server, secret)
             if not secret:
                 raise HTTPException(status.HTTP_400_BAD_REQUEST, "Access token was rejected") from None
             try:

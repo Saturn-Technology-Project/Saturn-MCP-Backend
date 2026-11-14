@@ -221,3 +221,30 @@ async def test_adding_a_factor_needs_a_recent_sign_in_and_tells_the_owner(client
     confirmed = await client.post("/auth/totp/confirm", headers=member, json={"code": current_code(setup.json()["secret"])})
     assert confirmed.status_code == 204, confirmed.text
     assert told == [("factor@saturn.ai", "totp")]
+
+
+@pytest.mark.asyncio
+async def test_signup_does_the_same_hashing_for_a_taken_address_as_for_a_free_one(client, monkeypatch):
+    """The hashes are nearly all of the response time; skipping them told a taken address apart."""
+    from app.features.identity.auth.services import mfa
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("app.features.identity.auth.controllers.auth.send_signup_code", noop)
+    hashed: list[int] = []
+    real = mfa.hash_password
+
+    def counting(value):
+        hashed.append(1)
+        return real(value)
+
+    monkeypatch.setattr(mfa, "hash_password", counting)
+
+    async def cost(email):
+        hashed.clear()
+        answer = await client.post("/auth/register/code", json={"name": "N", "email": email, "password": "password1"})
+        assert answer.status_code == 204, answer.text
+        return len(hashed)
+
+    assert await cost("free-address@saturn.ai") == await cost("rick@saturn.ai") == 2

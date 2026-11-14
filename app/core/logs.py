@@ -26,7 +26,7 @@ request_id_var: ContextVar[str] = ContextVar("request_id", default="")
 _trace_var: ContextVar[str] = ContextVar("trace", default="")
 
 REQUEST_ID_HEADER = "X-Request-Id"
-_QUIET_PATHS = frozenset({"/healthz", "/health", "/"})
+_QUIET_PATHS = frozenset({"/healthz", "/health", "/status", "/status/history", "/"})
 _requests = logging.getLogger("saturn.request")
 _errors = logging.getLogger("saturn.error")
 

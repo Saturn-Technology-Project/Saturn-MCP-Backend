@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.origin_auth import request_path
 from app.db.database import get_session
+from app.features.credentials.vault.services.pq_crypto import warm_content_key
 from app.models import Employee, Organization, User
 from app.features.organization.org.services.access import allows
 from app.features.organization.org.services.mapping_service import mapping_service
@@ -89,6 +90,7 @@ async def get_current_user(
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Organization is suspended")
     if not _mfa_exempt(path) and await _admin_needs_mfa(session, user):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "MFA setup is required")
+    await warm_content_key(user.organization_id)
     return user
 
 
@@ -102,7 +104,7 @@ _MFA_SETUP_PREFIXES = ("/auth/logout", "/auth/mfa", "/auth/totp", "/auth/passkey
 
 
 def _mfa_exempt(path: str) -> bool:
-    if path in {"/", "/health", "/healthz", "/auth/me"}:
+    if path in {"/", "/health", "/healthz", "/status", "/auth/me"}:
         return True
     return path.startswith(_MFA_SETUP_PREFIXES)
 
@@ -131,7 +133,7 @@ ActorDep = Annotated[str, Depends(get_actor_id)]
 
 def require_access(resource: str, level: str):
     async def _check(session: SessionDep, user: CurrentUser) -> Employee:
-        employee = await mapping_service.require_employee(session, user)
+        employee = await mapping_service.membership_for_check(session, user)
         if not allows(employee.permissions, resource, level):
             raise HTTPException(
                 status.HTTP_403_FORBIDDEN,

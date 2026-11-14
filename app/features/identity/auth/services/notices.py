@@ -9,7 +9,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.enums import RunStatus
+from app.core.enums import ExecutionState, RunStatus
 from app.core.ids import new_id
 from app.features.identity.auth.models.notice_delivery import NoticeDelivery
 from app.features.identity.auth.models.user import User
@@ -170,7 +170,7 @@ async def _send_task(
         state = await session.scalar(
             select(Approval.execution_state).where(
                 Approval.run_id == run.id,
-                Approval.execution_state == "uncertain",
+                Approval.execution_state == ExecutionState.UNCERTAIN.value,
             )
         )
         uncertain = state is not None

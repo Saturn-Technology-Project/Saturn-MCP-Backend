@@ -282,7 +282,7 @@ jobs:
             --platform managed \
             --allow-unauthenticated \
             --port 8000 \
-            --timeout 300 \
+            --timeout 3600 \
             --no-session-affinity \
             --cpu 1 \
             --memory 512Mi \

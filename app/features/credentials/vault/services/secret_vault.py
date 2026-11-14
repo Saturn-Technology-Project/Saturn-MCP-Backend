@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import logging
 import re
+import threading
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -101,21 +102,27 @@ def _gcp_drop_legacy(project: str, secret_id: str, organization_id: str, user_id
         _gcp_delete(project, legacy)
 
 
-async def _ciphertext(session: AsyncSession, secret_id: str, organization_id: str) -> str:
+async def _ciphertext(session: AsyncSession, secret_id: str, organization_id: str, *, fresh: bool = False) -> str:
     project = _project()
     if project:
         if not organization_id:
             return ""
         return await asyncio.to_thread(_gcp_read, project, secret_id, organization_id)
-    row = await session.get(SecretVault, secret_id)
+    row = await session.get(SecretVault, secret_id, populate_existing=fresh)
     return row.ciphertext if row is not None else ""
 
 
-async def get_secret(session: AsyncSession, secret_id: str, organization_id: str, user_id: str = "") -> str:
+async def get_secret(
+    session: AsyncSession, secret_id: str, organization_id: str, user_id: str = "", *, fresh: bool = False
+) -> str:
+    """With fresh, read the entry again even if this session already holds a copy another writer may have replaced."""
     if not secret_id or not organization_id:
         return ""
     return await open_secret_async(
-        await _ciphertext(session, secret_id, organization_id), organization_id, user_id, vault_context(secret_id)
+        await _ciphertext(session, secret_id, organization_id, fresh=fresh),
+        organization_id,
+        user_id,
+        vault_context(secret_id),
     )
 
 
@@ -170,10 +177,20 @@ async def _db_delete(session: AsyncSession, secret_id: str) -> None:
         await session.flush()
 
 
-def _client():
-    from google.cloud import secretmanager
+_shared_client = None
+_client_lock = threading.Lock()
 
-    return secretmanager.SecretManagerServiceClient()
+
+def _client():
+    """One client for the process. Building one opens a gRPC channel and fetches credentials,
+    which used to happen again on every read and write."""
+    global _shared_client
+    with _client_lock:
+        if _shared_client is None:
+            from google.cloud import secretmanager
+
+            _shared_client = secretmanager.SecretManagerServiceClient()
+        return _shared_client
 
 
 def _gcp_put(project: str, gcp_name: str, blob: str) -> None:

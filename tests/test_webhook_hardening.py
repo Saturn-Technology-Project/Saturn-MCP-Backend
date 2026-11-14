@@ -265,3 +265,105 @@ async def test_enqueue_retries_an_id_collision_and_only_drops_true_duplicates(cl
 
     await _with_session(duplicate)
     assert await _with_session(keys) == ["approval.granted:fresh", "approval.granted:org_enqueue:0"]
+
+
+# Sending must not hold the rows: a slow receiver used to keep row locks and a transaction open.
+
+
+async def test_nothing_is_locked_or_uncommitted_while_a_webhook_is_out(client, monkeypatch, fake_secret):
+    await _with_session(lambda session: _stage_org(session, "org_slow", 2))
+    during: list[tuple[bool, list[bool]]] = []
+    holder = {}
+
+    async def observe(_url, _body, _headers):
+        # A second session sees the claim, so it is committed, and the sending one holds no transaction.
+        async def claimed(other):
+            rows = list(await other.scalars(select(WebhookDelivery).where(WebhookDelivery.organization_id == "org_slow")))
+            return [webhook_service._as_utc(row.next_attempt_at) > utcnow() and row.status == "pending" for row in rows]
+
+        during.append((holder["session"].in_transaction(), await _with_session(claimed)))
+        return 200, ""
+
+    monkeypatch.setattr("app.features.webhooks.services.webhook_service.send_webhook", observe)
+
+    async def deliver(session):
+        holder["session"] = session
+        return await webhook_service.deliver_due(session)
+
+    assert await _with_session(deliver) == 2
+    assert during == [(False, [True, True]), (False, [True, True])]
+
+    async def settled(session):
+        rows = list(await session.scalars(select(WebhookDelivery).where(WebhookDelivery.organization_id == "org_slow")))
+        return sorted((row.status, row.attempt_count) for row in rows)
+
+    assert await _with_session(settled) == [("delivered", 1), ("delivered", 1)]
+
+
+async def test_a_delivery_deleted_while_it_is_out_does_not_break_the_batch(client, monkeypatch, fake_secret):
+    async def stage(session):
+        await _stage_org(session, "org_gone", 1)
+        await _stage_org(session, "org_stays", 1)
+
+    await _with_session(stage)
+
+    async def send(url, _body, _headers):
+        if "org_gone" in url:
+
+            async def remove(other):
+                await other.delete(await other.get(WebhookDelivery, "whd_org_gone_0"))
+
+            await _with_session(remove)
+        return 200, ""
+
+    monkeypatch.setattr("app.features.webhooks.services.webhook_service.send_webhook", send)
+    assert await _with_session(lambda session: webhook_service.deliver_due(session)) == 2
+
+    async def left(session):
+        rows = list(await session.scalars(select(WebhookDelivery).where(WebhookDelivery.organization_id.in_(("org_gone", "org_stays")))))
+        return [(row.id, row.status) for row in rows]
+
+    assert await _with_session(left) == [("whd_org_stays_0", "delivered")]
+
+
+async def test_a_key_service_outage_postpones_a_delivery_instead_of_killing_it(client, monkeypatch):
+    from app.features.credentials.vault.services.pq_crypto import KeyUnavailable
+
+    await _with_session(lambda session: _stage_org(session, "org_outage", 1))
+
+    async def outage(*_args, **_kwargs):
+        raise KeyUnavailable()
+
+    sent: list[str] = []
+
+    async def send(url, _body, _headers):
+        sent.append(url)
+        return 200, ""
+
+    monkeypatch.setattr("app.features.webhooks.services.webhook_service.get_secret", outage)
+    monkeypatch.setattr("app.features.webhooks.services.webhook_service.send_webhook", send)
+    await _with_session(lambda session: webhook_service.deliver_due(session))
+
+    async def state(session):
+        row = await session.get(WebhookDelivery, "whd_org_outage_0")
+        return row.status, row.attempt_count, webhook_service._as_utc(row.next_attempt_at) > utcnow()
+
+    assert await _with_session(state) == ("pending", 0, True)
+    assert sent == []
+
+
+async def test_a_key_service_outage_answers_503_not_reconnect(client, monkeypatch):
+    from app.features.credentials.vault.services import pq_crypto
+
+    created = await client.post("/org/webhooks", json={"url": "https://hooks.example.com/a", "events": ["approval.granted"]})
+    assert created.status_code == 201, created.text
+
+    def down(_data):
+        raise ConnectionError("kms did not answer")
+
+    monkeypatch.setattr(pq_crypto, "_mac", down)
+    monkeypatch.setattr(pq_crypto, "_keys", {})
+    answer = await client.get(f"/org/webhooks/{created.json()['id']}/secret")
+    monkeypatch.undo()
+    assert answer.status_code == 503, answer.text
+    assert answer.headers["retry-after"] == "30"

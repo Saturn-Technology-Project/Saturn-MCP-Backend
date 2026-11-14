@@ -377,7 +377,7 @@ class AuthService:
     ) -> None:
         from app.core.rate_limit import reauth_allowed
 
-        if not reauth_allowed(user.id):
+        if not await reauth_allowed(user.id):
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many attempts", headers={"Retry-After": "900"})
         if not await in_thread(verify_password, current_password, user.password_hash):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Current password is incorrect")
@@ -393,7 +393,7 @@ class AuthService:
         """Whether the caller may replace the stored password value. Changes nothing."""
         from app.core.rate_limit import reauth_allowed
 
-        if not reauth_allowed(user.id):
+        if not await reauth_allowed(user.id):
             raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many attempts", headers={"Retry-After": "900"})
         if not current_password or not await in_thread(verify_password, current_password, user.password_hash):
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Current password is incorrect")

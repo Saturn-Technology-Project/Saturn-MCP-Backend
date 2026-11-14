@@ -28,13 +28,25 @@ from tests.catalog import seed_test_catalog
 @pytest.fixture(autouse=True)
 def reset_rate_limits():
     from app.core.rate_limit import reset
+    from app.core.status import reset as reset_status
     from app.features.identity.auth.services.totp import reset as reset_totp
 
     reset()
     reset_totp()
+    reset_status()
     yield
     reset()
     reset_totp()
+
+
+@pytest.fixture(autouse=True)
+def fresh_mcp_clients():
+    # Kept upstream clients belong to the event loop and transport of the test that made them.
+    from app.features.mcp.servers.services import mcp_remote
+
+    mcp_remote._clients.clear()
+    yield
+    mcp_remote._clients.clear()
 
 
 @pytest.fixture(autouse=True)

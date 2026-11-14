@@ -99,14 +99,18 @@ async def get_org(session: SessionDep, user: CurrentUser):
     if allows(permissions, "team", "read"):
         members_list = await member_service.list_members(session, user.organization_id)
         users = [serialize_org_user(item) for item in members_list]
-    agents = [
-        serialize_agent(agent)
-        for agent in await mapping_service.list_org_agents(session, user.organization_id)
-    ]
-    servers = [
-        serialize_mcp_server(server)
-        for server in await mapping_service.list_org_mcp_servers(session, user.organization_id)
-    ]
+    # The same access GET /agents and GET /mcp-servers ask for. An agent carries its instructions,
+    # so a member with no agent access must not receive them through the workspace summary.
+    agents, servers = [], []
+    if allows(permissions, "agents", "read"):
+        agents = [
+            serialize_agent(agent)
+            for agent in await mapping_service.list_org_agents(session, user.organization_id)
+        ]
+        servers = [
+            serialize_mcp_server(server)
+            for server in await mapping_service.list_org_mcp_servers(session, user.organization_id)
+        ]
     return OrgWorkspaceRead(
         organization=serialize_organization(org),
         catalog=permission_catalog(),

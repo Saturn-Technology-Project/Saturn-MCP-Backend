@@ -123,3 +123,74 @@ def test_the_tenant_key_cache_is_bounded(monkeypatch):
     for n in range(6):
         pq_crypto.open_secret(pq_crypto.seal("x", f"org_{n}"), f"org_{n}")
     assert len(pq_crypto._keys) <= 3
+
+
+def test_a_key_service_outage_is_not_reported_as_a_broken_secret(monkeypatch):
+    """SecretNeedsReconnect tells people to reconnect and kills webhook deliveries. An outage ends by itself."""
+    from app.features.credentials.vault.services import pq_crypto
+
+    token = seal("gho-example-token", "org_acme")
+
+    def down(_data):
+        raise ConnectionError("kms did not answer")
+
+    monkeypatch.setattr(pq_crypto, "_mac", down)
+    monkeypatch.setattr(pq_crypto, "_keys", {})
+    with pytest.raises(pq_crypto.KeyUnavailable):
+        open_secret(token, "org_acme")
+    monkeypatch.undo()
+    assert open_secret(token, "org_acme") == "gho-example-token"
+
+
+def test_the_key_cache_survives_many_threads_at_its_limit(monkeypatch):
+    """seal and open run on worker threads; evicting while another thread iterates used to raise."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.features.credentials.vault.services import pq_crypto
+
+    monkeypatch.setattr(pq_crypto, "_MAX_CACHED_KEYS", 4)
+    monkeypatch.setattr(pq_crypto, "_keys", {})
+    tokens = {f"org_{index}": seal("value", f"org_{index}") for index in range(12)}
+
+    def work(turn: int) -> bool:
+        organization_id = f"org_{turn % 12}"
+        return open_secret(tokens[organization_id], organization_id) == "value"
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        assert all(pool.map(work, range(400)))
+    assert len(pq_crypto._keys) <= 4
+
+
+async def test_the_content_key_is_fetched_off_the_event_loop_before_it_is_needed(monkeypatch):
+    """A KMS call made while sealing would hold the event loop for every request."""
+    import threading
+
+    from app.features.credentials.vault.services import pq_crypto
+
+    loop_thread = threading.get_ident()
+    calls: list[bool] = []
+    real = pq_crypto._mac
+
+    def mac(data):
+        calls.append(threading.get_ident() == loop_thread)
+        return real(data)
+
+    monkeypatch.setattr(pq_crypto, "_mac", mac)
+    monkeypatch.setattr(pq_crypto, "_content_keys", {})
+    await pq_crypto.warm_content_key("org_warm")
+    assert calls == [False]
+    # The synchronous readers now find it, and warming again does nothing until it nears expiry.
+    key = pq_crypto.content_key("org_warm")
+    await pq_crypto.warm_content_key("org_warm")
+    assert calls == [False]
+    expires, _ = pq_crypto._content_keys["org_warm"]
+    pq_crypto._content_keys["org_warm"] = (expires - pq_crypto._CONTENT_TTL_SECONDS + 10, key)
+    await pq_crypto.warm_content_key("org_warm")
+    assert calls == [False, False]
+
+    def down(_data):
+        raise ConnectionError("kms did not answer")
+
+    monkeypatch.setattr(pq_crypto, "_mac", down)
+    monkeypatch.setattr(pq_crypto, "_content_keys", {})
+    await pq_crypto.warm_content_key("org_warm")  # left for the code that needs the key to report

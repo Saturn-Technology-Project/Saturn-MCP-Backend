@@ -341,7 +341,7 @@ MAX_REDIRECT_URI_LENGTH = 2048
 
 @router.post("/oauth/register", status_code=201)
 async def register_client(request: Request, session: SessionDep) -> dict:
-    if not registration_allowed(request):
+    if not await registration_allowed(request):
         raise HTTPException(status_code=429, detail="Too many registrations", headers={"Retry-After": "600"})
     try:
         body = await request.json()
@@ -587,7 +587,7 @@ async def oauth_login(request: Request, session: SessionDep):
     if refused is not None:
         return refused
     form = await _posted(request)
-    if not login_allowed(request, form.get("email", "")):
+    if not await login_allowed(request, form.get("email", "")):
         return _page("Connect Agents", "<h1>請稍後再試</h1><p>Too many sign-in attempts.</p>", 429)
     fields = _posted_fields(form)
     try:
@@ -600,7 +600,7 @@ async def oauth_login(request: Request, session: SessionDep):
         )
     except HTTPException:
         return _page("Connect Agents", "<h1>登入失敗</h1><p>Email or password is incorrect.</p>", 401)
-    login_succeeded(form.get("email", ""))
+    await login_succeeded(form.get("email", ""))
     try:
         # The same factors as the console sign-in. An emailed code is never added as a fallback.
         pending = await mfa_service.start_login(session, user)
@@ -631,7 +631,7 @@ async def oauth_login_code(request: Request, session: SessionDep):
         return refused
     form = await _posted(request)
     fields = _posted_fields(form)
-    if not code_check_allowed(request):
+    if not await code_check_allowed(request):
         return _page("Connect Agents", "<h1>請稍後再試</h1><p>Too many sign-in attempts.</p>", 429)
     challenge = form.get("challenge", "")
     further: list[str] = []
@@ -660,7 +660,7 @@ async def oauth_login_passkey(request: Request, session: SessionDep):
 
     form = await _posted(request)
     fields = _posted_fields(form)
-    if not code_check_allowed(request):
+    if not await code_check_allowed(request):
         return _page("Connect Agents", "<h1>請稍後再試</h1><p>Too many sign-in attempts.</p>", 429)
     try:
         credential = json.loads(form.get("credential", ""))

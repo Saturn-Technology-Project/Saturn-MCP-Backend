@@ -6,7 +6,14 @@ sealed again with the new one, in one transaction:
 
 - pq2 credentials (vault entries, org credentials, MCP OAuth secrets, TOTP secrets),
 - s2 sealed content (audit payloads, tool arguments),
-- keyed approval digests, recomputed from the arguments they bind.
+- keyed approval digests (approvals.parameter_digest and the digest kept inside
+  actions.arguments), recomputed from the arguments they bind.
+
+When SATURN_SECRET_PROJECT is set the vault lives in Secret Manager, not in the
+database. Those entries are re-sealed too, each as a new secret version. Secret
+Manager is outside the database transaction, so its writes happen last and only
+after everything opened; a run that stops part way can be repeated, because an
+entry the new key already opens is skipped.
 
     python -m app.cli.reseal --old-key OLD_VERSION --new-key NEW_VERSION           # dry run
     python -m app.cli.reseal --old-key OLD_VERSION --new-key NEW_VERSION --apply
@@ -34,7 +41,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric.mlkem import MLKEM1024PrivateKey
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from sqlalchemy import MetaData, Table, select, update
+from sqlalchemy import MetaData, Table, select, text, update
 
 from app.features.credentials.vault.services.pq_crypto import (
     _BOUND_PREFIX as PQ_BOUND_PREFIX,
@@ -136,7 +143,11 @@ class Report:
     resealed: dict[str, int] = field(default_factory=dict)
     digests: int = 0
     unopened: list[str] = field(default_factory=list)
+    # Digests that stay as they are, each with the reason. An approval waiting on one of these
+    # has to be requested again after the key changes.
     digests_left: list[str] = field(default_factory=list)
+    # Secret Manager entries the new key already opens: a previous run got that far.
+    already: list[str] = field(default_factory=list)
     # Prefix-shaped text where Saturn never writes a sealed value. Reported, never blocking:
     # a tenant can type "pq2.x" into a name or a prompt.
     ignored: list[str] = field(default_factory=list)
@@ -234,13 +245,44 @@ class Resealer:
 
 
 def _plain_arguments(keys: Keys, organization_id: str, stored: Any) -> Any:
-    """The arguments an approval's digest was computed over, opened with the given keys if sealed."""
-    if isinstance(stored, dict) and isinstance(stored.get("sealed"), str) and set(stored) <= {"sealed", "encryption"}:
+    """The arguments a digest was computed over, opened with the given keys. None when the server cannot read them."""
+    if not isinstance(stored, dict):
+        return stored
+    if isinstance(stored.get("envelope"), dict):
+        # Sealed for the organization's own payload key. Only its members can open these.
+        return None
+    if isinstance(stored.get("sealed"), str) and set(stored) <= {"digest", "sealed", "encryption"}:
         if stored.get("encryption", _SERVER_SEALED) != _SERVER_SEALED:
             return None
         body = keys.open_content(stored["sealed"], organization_id)
         return json.loads(body) if body is not None else None
+    if set(stored) == {"digest"}:
+        # Written before arguments were kept: there is nothing to recompute the digest from.
+        return None
     return stored
+
+
+def _legacy_digest(arguments: Any) -> str:
+    canonical = json.dumps(arguments, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _moved_digest(old: Keys, new: Keys, organization_id: str, digest: str, arguments: Any) -> tuple[str | None, str]:
+    """(the digest under the new key, "") or (None, why it stays). An empty reason with None means nothing to do."""
+    if arguments is None:
+        return None, "the server cannot read the arguments"
+    if hmac.compare_digest(digest, old.digest(organization_id, arguments)):
+        return new.digest(organization_id, arguments), ""
+    if hmac.compare_digest(digest, _legacy_digest(arguments)):
+        # A plain SHA-256 from before digests were keyed. It does not depend on the KMS key.
+        return None, ""
+    return None, "it does not match the stored arguments"
+
+
+async def load_tenants(connection: Any) -> Tenants:
+    users = {str(r.id): str(r.organization_id) for r in await connection.execute(text("SELECT id, organization_id FROM users"))}
+    organizations = [str(r.id) for r in await connection.execute(text("SELECT id FROM organizations"))]
+    return Tenants(users, organizations)
 
 
 async def reseal(connection: Any, old: Keys, new: Keys, apply: bool) -> Report:
@@ -248,13 +290,12 @@ async def reseal(connection: Any, old: Keys, new: Keys, apply: bool) -> Report:
     metadata = MetaData()
     await connection.run_sync(metadata.reflect)
     tables: dict[str, Table] = dict(metadata.tables)
-    users = {str(r.id): str(r.organization_id) for r in await connection.execute(select(tables["users"].c.id, tables["users"].c.organization_id))}
-    organizations = [str(r.id) for r in await connection.execute(select(tables["organizations"].c.id))]
     report = Report()
-    resealer = Resealer(old, new, Tenants(users, organizations), report)
+    resealer = Resealer(old, new, await load_tenants(connection), report)
 
     # Digests first: they are recomputed from arguments opened with the old content key.
     digest_updates: list[tuple[Any, str]] = []
+    action_digests: dict[str, str] = {}
     if {"approvals", "actions", "runs"} <= tables.keys():
         approvals, actions, runs = tables["approvals"], tables["actions"], tables["runs"]
         query = (
@@ -266,10 +307,25 @@ async def reseal(connection: Any, old: Keys, new: Keys, apply: bool) -> Report:
         for row in await connection.execute(query):
             organization_id = str(row.organization_id)
             arguments = _plain_arguments(old, organization_id, row.arguments)
-            if arguments is not None and hmac.compare_digest(row.parameter_digest, old.digest(organization_id, arguments)):
-                digest_updates.append((row.id, new.digest(organization_id, arguments)))
-            else:
-                report.digests_left.append(f"approvals {row.id}")
+            moved, reason = _moved_digest(old, new, organization_id, row.parameter_digest, arguments)
+            if moved is not None:
+                digest_updates.append((row.id, moved))
+            elif reason:
+                report.digests_left.append(f"approvals {row.id}: {reason}")
+
+        # The gateway keeps the same digest next to the sealed arguments, and checks both.
+        query = select(actions.c.id, actions.c.arguments, runs.c.organization_id).join(runs, runs.c.id == actions.c.run_id)
+        for row in await connection.execute(query):
+            stored = row.arguments
+            if not isinstance(stored, dict) or not isinstance(stored.get("digest"), str) or not stored["digest"]:
+                continue
+            organization_id = str(row.organization_id)
+            arguments = _plain_arguments(old, organization_id, stored)
+            moved, reason = _moved_digest(old, new, organization_id, stored["digest"], arguments)
+            if moved is not None:
+                action_digests[str(row.id)] = moved
+            elif reason:
+                report.digests_left.append(f"actions {row.id}: {reason}")
 
     for name, table in tables.items():
         if name == "alembic_version":
@@ -287,6 +343,10 @@ async def reseal(connection: Any, old: Keys, new: Keys, apply: bool) -> Report:
                     continue
                 row_key = "/".join(str(data[key.name]) for key in keys)
                 new_value, changed = resealer.value(name, f"{name} {row_key} {column.name}", data, current)
+                if name == "actions" and column.name == "arguments" and isinstance(new_value, dict):
+                    moved = action_digests.get(str(data.get("id")))
+                    if moved is not None:
+                        new_value, changed = {**new_value, "digest": moved}, True
                 if changed:
                     changes[column.name] = new_value
             if changes:
@@ -295,7 +355,7 @@ async def reseal(connection: Any, old: Keys, new: Keys, apply: bool) -> Report:
                     condition = [key == data[key.name] for key in keys]
                     await connection.execute(update(table).where(*condition).values(**changes))
 
-    report.digests = len(digest_updates)
+    report.digests = len(digest_updates) + len(action_digests)
     if apply:
         approvals = tables["approvals"]
         for approval_id, digest in digest_updates:
@@ -303,18 +363,98 @@ async def reseal(connection: Any, old: Keys, new: Keys, apply: bool) -> Report:
     return report
 
 
+class SecretStore:
+    """The Secret Manager entries secret_vault writes: sat2-<org tag>-<id tag>-<name>, and the older sat-<name>."""
+
+    def __init__(self, project: str) -> None:
+        from google.cloud import secretmanager
+
+        self._client = secretmanager.SecretManagerServiceClient()
+        self._parent = f"projects/{project}"
+
+    def names(self) -> list[str]:
+        found = []
+        for secret in self._client.list_secrets(request={"parent": self._parent}):
+            short = secret.name.rsplit("/", 1)[-1]
+            if short.startswith(("sat2-", "sat-")):
+                found.append(short)
+        return sorted(found)
+
+    def read(self, name: str) -> str:
+        from google.api_core.exceptions import FailedPrecondition, NotFound
+
+        try:
+            response = self._client.access_secret_version(name=f"{self._parent}/secrets/{name}/versions/latest")
+        except (NotFound, FailedPrecondition):
+            # No version yet, or the latest one is disabled or destroyed: nothing to move.
+            return ""
+        return response.payload.data.decode()
+
+    def write(self, name: str, blob: str) -> None:
+        self._client.add_secret_version(parent=f"{self._parent}/secrets/{name}", payload={"data": blob.encode()})
+
+
+def _org_tag(organization_id: str) -> str:
+    # The tag secret_vault._gcp_name puts in a sat2 name.
+    return hashlib.sha256(f"saturn-secret-org\n{organization_id}".encode()).hexdigest()[:24]
+
+
+def reseal_store(store: Any, old: Keys, new: Keys, tenants: Tenants, report: Report) -> list[tuple[str, str]]:
+    """(name, re-sealed value) for every vault entry in Secret Manager. Reads only; write_store writes."""
+    by_tag = {_org_tag(organization_id): organization_id for organization_id in tenants.organizations}
+    pending: list[tuple[str, str]] = []
+    for name in store.names():
+        blob = store.read(name)
+        if not blob.startswith((PQ_PREFIX, PQ_BOUND_PREFIX)):
+            continue
+        location = f"secret_manager {name} ciphertext"
+        # A sat2 name says which organization owns it; an old sat- name does not.
+        owner = by_tag.get(name.split("-")[1]) if name.startswith("sat2-") else None
+        contexts = tenants.contexts_for("secret_manager", {"organization_id": owner} if owner else {})
+        if owner:
+            contexts = [item for item in contexts if item[0] == owner]
+        bound = split_bound(blob)
+        context = bound[0] if bound is not None else ""
+        for organization_id, user_id in contexts:
+            plain = old.open(blob, organization_id, user_id)
+            if plain is not None:
+                pending.append((name, new.seal(plain, organization_id, user_id, context)))
+                report.count("secret_manager")
+                break
+        else:
+            if any(new.open(blob, organization_id, user_id) is not None for organization_id, user_id in contexts):
+                report.already.append(location)
+            else:
+                report.unopened.append(location)
+    return pending
+
+
+def write_store(store: Any, pending: list[tuple[str, str]]) -> None:
+    for name, blob in pending:
+        store.write(name, blob)
+
+
 async def _run(old_key: str, new_key: str, apply: bool, allow_unopened: bool) -> int:
+    from app.core.config import get_settings
     from app.db.database import engine
 
     old, new = Keys(kms_mac(old_key)), Keys(kms_mac(new_key))
+    project = (get_settings().saturn_secret_project or "").strip()
     async with engine.connect() as connection:
         transaction = await connection.begin()
         report = await reseal(connection, old, new, apply)
+        store, pending = None, []
+        if project:
+            tenants = await load_tenants(connection)
+            store = await asyncio.to_thread(SecretStore, project)
+            pending = await asyncio.to_thread(reseal_store, store, old, new, tenants, report)
         for table, count in sorted(report.resealed.items()):
             print(f"resealed {table}: {count} rows")
         print(f"approval digests recomputed: {report.digests}")
         for location in report.digests_left:
             print(f"digest left as is: {location}")
+        for location in report.already:
+            print(f"already under the new key: {location}")
         for location in report.unopened:
             print(f"could not open: {location}")
         for location in report.ignored:
@@ -324,6 +464,10 @@ async def _run(old_key: str, new_key: str, apply: bool, allow_unopened: bool) ->
             print("rolled back: some values did not open with the old key", file=sys.stderr)
             return 1
         if apply:
+            # Secret Manager first. If it fails the database rolls back, and the next run skips
+            # the entries that already moved.
+            if store is not None:
+                await asyncio.to_thread(write_store, store, pending)
             await transaction.commit()
             print("committed")
         else:

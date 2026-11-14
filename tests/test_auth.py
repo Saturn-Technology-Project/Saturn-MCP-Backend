@@ -227,10 +227,10 @@ async def test_login_migration_hides_unknown_accounts_and_is_rate_limited(client
     assert missing.status_code == 200
     assert missing.json() == {}
 
-    monkeypatch.setattr(
-        "app.features.identity.auth.controllers.auth.migration_allowed",
-        lambda _request, _email=None: False,
-    )
+    async def refuse(_request, _email=None):
+        return False
+
+    monkeypatch.setattr("app.features.identity.auth.controllers.auth.migration_allowed", refuse)
     limited = await client.post(
         "/auth/login/migration",
         json={"email": "nobody@example.com", "password": "v2.00"},

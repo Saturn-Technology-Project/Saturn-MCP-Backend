@@ -121,10 +121,12 @@ def _use_redis() -> bool:
 def _redis_client():
     global _redis
     if _redis is None:
-        import redis
+        import redis.asyncio as redis_async
 
-        # Short timeouts: the client is synchronous, so a slow Redis must not stall the event loop.
-        _redis = redis.Redis.from_url(
+        # Asynchronous, so a slow Redis delays only the request that is waiting for it. The
+        # synchronous client this replaced stopped the whole event loop for up to its timeout.
+        # The timeouts stay short: a limiter that cannot answer refuses, and should do so quickly.
+        _redis = redis_async.Redis.from_url(
             get_settings().redis_url,
             socket_timeout=0.5,
             socket_connect_timeout=0.5,
@@ -156,9 +158,9 @@ def _memory_allow(key: str, *, limit: int, window: int) -> bool:
     return True
 
 
-def _redis_allow(key: str, *, limit: int, window: int) -> bool:
+async def _redis_allow(key: str, *, limit: int, window: int) -> bool:
     client = _redis_client()
-    count = int(client.eval(_INCR_WITH_TTL, 1, f"saturn:rate:{key}", int(window)))
+    count = int(await client.eval(_INCR_WITH_TTL, 1, f"saturn:rate:{key}", int(window)))
     return count <= limit
 
 
@@ -167,11 +169,11 @@ def _memory_count(key: str, window: int) -> int:
     return sum(1 for stamp in _hits.get(key, []) if now - stamp < window)
 
 
-def under_limit(key: str, *, limit: int, window: int = WINDOW_SECONDS) -> bool:
+async def under_limit(key: str, *, limit: int, window: int = WINDOW_SECONDS) -> bool:
     """Whether key has fewer than limit hits in the window, without adding one."""
     if _use_redis():
         try:
-            raw = _redis_client().get(f"saturn:rate:{key}")
+            raw = await _redis_client().get(f"saturn:rate:{key}")
             return int(raw or 0) < limit
         except Exception:
             return False
@@ -180,10 +182,10 @@ def under_limit(key: str, *, limit: int, window: int = WINDOW_SECONDS) -> bool:
     return _memory_count(key, window) < limit
 
 
-def allow(key: str, *, limit: int = MAX_HITS, window: int = WINDOW_SECONDS) -> bool:
+async def allow(key: str, *, limit: int = MAX_HITS, window: int = WINDOW_SECONDS) -> bool:
     if _use_redis():
         try:
-            return _redis_allow(key, limit=limit, window=window)
+            return await _redis_allow(key, limit=limit, window=window)
         except Exception:
             return False
     if not get_settings().in_process_runtime:
@@ -191,11 +193,11 @@ def allow(key: str, *, limit: int = MAX_HITS, window: int = WINDOW_SECONDS) -> b
     return _memory_allow(key, limit=limit, window=window)
 
 
-def release(key: str) -> None:
+async def release(key: str) -> None:
     """Hand back one hit that allow() counted. Used when the attempt turned out not to be a failure."""
     if _use_redis():
         try:
-            _redis_client().eval(_DECR_FLOOR, 1, f"saturn:rate:{key}")
+            await _redis_client().eval(_DECR_FLOOR, 1, f"saturn:rate:{key}")
         except Exception:  # noqa: S110
             # The hit stays counted and expires with its window: the safe direction.
             pass
@@ -205,19 +207,19 @@ def release(key: str) -> None:
         bucket.pop()
 
 
-def registration_allowed(request: Request) -> bool:
-    return allow(f"oauth-register:{limit_address(request)}")
+async def registration_allowed(request: Request) -> bool:
+    return await allow(f"oauth-register:{limit_address(request)}")
 
 
-def signup_allowed(request: Request) -> bool:
+async def signup_allowed(request: Request) -> bool:
     """Account sign-up. Its own budget, so agent client registrations cannot use it up."""
-    return allow(f"signup:{limit_address(request)}")
+    return await allow(f"signup:{limit_address(request)}")
 
 
 LOGIN_ACCOUNT_FAILURES = 10
 
 
-def login_allowed(request: Request, email: str | None = None) -> bool:
+async def login_allowed(request: Request, email: str | None = None) -> bool:
     """Whether this sign-in attempt may go ahead. With an email, it also takes one of the account's slots.
 
     Per account, so rotating addresses does not give unlimited guesses against one user. The slot
@@ -226,43 +228,43 @@ def login_allowed(request: Request, email: str | None = None) -> bool:
     A correct password gives its slot back (login_succeeded), so an owner who signs in often is
     never locked out.
     """
-    if not allow(f"login:{limit_address(request)}"):
+    if not await allow(f"login:{limit_address(request)}"):
         return False
     if not (email or "").strip():
         return True
-    return allow(_login_account_key(email), limit=LOGIN_ACCOUNT_FAILURES)
+    return await allow(_login_account_key(email), limit=LOGIN_ACCOUNT_FAILURES)
 
 
 def _login_account_key(email: str) -> str:
     return f"login-account:{email.strip().lower()}"
 
 
-def login_succeeded(email: str | None) -> None:
+async def login_succeeded(email: str | None) -> None:
     """The password was right, or the attempt failed for a reason that was not a wrong password."""
     if email:
-        release(_login_account_key(email))
+        await release(_login_account_key(email))
 
 
-def migration_allowed(request: Request, email: str | None = None) -> bool:
-    if not allow(f"login-migration:{limit_address(request)}", limit=24):
+async def migration_allowed(request: Request, email: str | None = None) -> bool:
+    if not await allow(f"login-migration:{limit_address(request)}", limit=24):
         return False
     if email is None:
         return True
     # It answers whether a legacy password is right, so it gets the same per-account cap as sign-in.
-    return allow(f"login-migration-account:{email.strip().lower()}", limit=10)
+    return await allow(f"login-migration-account:{email.strip().lower()}", limit=10)
 
 
-def code_check_allowed(request: Request, subject: str | None = None) -> bool:
+async def code_check_allowed(request: Request, subject: str | None = None) -> bool:
     """Checking an emailed, reset or authenticator code. Per address, and per account when known.
 
     Each code is also capped at a few guesses; this stops one address from spreading guesses
     over many codes and accounts.
     """
-    if not allow(f"code-check:{limit_address(request)}", limit=30):
+    if not await allow(f"code-check:{limit_address(request)}", limit=30):
         return False
     if not subject:
         return True
-    return allow(f"code-check-account:{subject.strip().lower()}", limit=15)
+    return await allow(f"code-check-account:{subject.strip().lower()}", limit=15)
 
 
 # Wrong emailed sign-in codes one account may collect in a day, across every challenge and
@@ -272,20 +274,20 @@ LOGIN_CODE_DAILY_FAILURES = 30
 _DAY_SECONDS = 86_400
 
 
-def login_code_open(user_id: str) -> bool:
-    return under_limit(f"login-code-fail:{user_id}", limit=LOGIN_CODE_DAILY_FAILURES, window=_DAY_SECONDS)
+async def login_code_open(user_id: str) -> bool:
+    return await under_limit(f"login-code-fail:{user_id}", limit=LOGIN_CODE_DAILY_FAILURES, window=_DAY_SECONDS)
 
 
-def login_code_failed(user_id: str) -> None:
-    allow(f"login-code-fail:{user_id}", limit=LOGIN_CODE_DAILY_FAILURES * 10, window=_DAY_SECONDS)
+async def login_code_failed(user_id: str) -> None:
+    await allow(f"login-code-fail:{user_id}", limit=LOGIN_CODE_DAILY_FAILURES * 10, window=_DAY_SECONDS)
 
 
-def reauth_allowed(user_id: str) -> bool:
-    return allow(f"reauth:{user_id}", limit=8, window=900)
+async def reauth_allowed(user_id: str) -> bool:
+    return await allow(f"reauth:{user_id}", limit=8, window=900)
 
 
-def accept_invite_allowed(request: Request) -> bool:
-    return allow(f"accept-invite:{limit_address(request)}", limit=20)
+async def accept_invite_allowed(request: Request) -> bool:
+    return await allow(f"accept-invite:{limit_address(request)}", limit=20)
 
 
 def reset() -> None:

@@ -73,15 +73,15 @@ async def test_admin_without_totp_is_blocked_until_setup(client):
     assert replayed.status_code == 400
 
 
-def test_totp_code_cannot_be_reused_within_90_seconds():
+async def test_totp_code_cannot_be_reused_within_90_seconds():
     secret = "JBSWY3DPEHPK3PXP"
     code = current_code(secret, now=1_800_000.0)
-    assert verify_code(secret, code, now=1_800_000.0) is True
-    assert verify_code(secret, code, now=1_800_000.0) is False
-    assert verify_code(secret, code, now=1_800_029.0) is False
-    assert verify_code(secret, code, now=1_800_035.0) is False
+    assert await verify_code(secret, code, now=1_800_000.0) is True
+    assert await verify_code(secret, code, now=1_800_000.0) is False
+    assert await verify_code(secret, code, now=1_800_029.0) is False
+    assert await verify_code(secret, code, now=1_800_035.0) is False
     next_code = current_code(secret, now=1_800_030.0)
-    assert verify_code(secret, next_code, now=1_800_030.0) is True
+    assert await verify_code(secret, next_code, now=1_800_030.0) is True
 
 
 async def test_totp_confirm_locks_out_after_five_failed_attempts(client):

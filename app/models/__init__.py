@@ -41,6 +41,7 @@ from app.features.tooling.tool_sets.models.tool_set import ToolSet, ToolSetItem
 from app.features.identity.auth.models.notice_delivery import NoticeDelivery
 from app.features.webhooks.models.webhook import WebhookAttempt, WebhookDelivery, WebhookEndpoint
 from app.features.identity.auth.models.user import User
+from app.shared.models.status_day import StatusDay
 
 __all__ = [
     "Action",
@@ -83,4 +84,5 @@ __all__ = [
     "agent_policies",
     "employee_agents",
     "employee_mcp_servers",
+    "StatusDay",
 ]

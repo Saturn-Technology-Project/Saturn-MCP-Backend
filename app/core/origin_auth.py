@@ -6,7 +6,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
-EXEMPT_PATHS = {"/healthz"}
+# Reachable without the origin secret, so a probe can tell the service is up. Each answers
+# only {"status": "ok"}. Everything else, GET /status included, needs the secret.
+EXEMPT_PATHS = {"/health", "/healthz"}
 DEFAULT_HEADER = "X-Saturn-Origin-Auth"
 
 

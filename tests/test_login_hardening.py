@@ -64,22 +64,22 @@ async def test_wrong_emailed_codes_are_capped_per_account_across_challenges(clie
     for _ in range(3):
         guess = await client.post("/auth/login/email", json={"challenge": token, "code": wrong})
         assert guess.status_code == 400, guess.text
-    assert not rate_limit.login_code_open(user_id)
+    assert not await rate_limit.login_code_open(user_id)
     # Even the right code is refused now, on this challenge and on any other.
     locked = await client.post("/auth/login/email", json={"challenge": token, "code": sent["code"]})
     assert locked.status_code == 429, locked.text
     rate_limit.reset()
-    assert rate_limit.login_code_open(user_id)
+    assert await rate_limit.login_code_open(user_id)
 
 
-def test_a_right_code_does_not_count_as_a_failure():
-    assert rate_limit.login_code_open("user_x")
+async def test_a_right_code_does_not_count_as_a_failure():
+    assert await rate_limit.login_code_open("user_x")
     for _ in range(rate_limit.LOGIN_CODE_DAILY_FAILURES - 1):
-        rate_limit.login_code_failed("user_x")
-    assert rate_limit.login_code_open("user_x")
-    rate_limit.login_code_failed("user_x")
-    assert not rate_limit.login_code_open("user_x")
-    assert rate_limit.login_code_open("user_y")
+        await rate_limit.login_code_failed("user_x")
+    assert await rate_limit.login_code_open("user_x")
+    await rate_limit.login_code_failed("user_x")
+    assert not await rate_limit.login_code_open("user_x")
+    assert await rate_limit.login_code_open("user_y")
 
 
 async def test_another_site_cannot_sign_a_visitor_out(client):

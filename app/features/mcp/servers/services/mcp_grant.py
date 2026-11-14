@@ -16,10 +16,10 @@ def _empty() -> dict[str, str]:
     return {"access_token": "", "refresh_token": "", "client_secret": ""}
 
 
-async def read_grant(session: AsyncSession, server: McpServer) -> dict[str, str]:
+async def read_grant(session: AsyncSession, server: McpServer, *, fresh: bool = False) -> dict[str, str]:
     if not server.credential_id:
         return _empty()
-    raw = await get_secret(session, server.credential_id, server.organization_id)
+    raw = await get_secret(session, server.credential_id, server.organization_id, fresh=fresh)
     return _parse(raw)
 
 

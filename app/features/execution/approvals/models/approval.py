@@ -1,13 +1,27 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Integer, Numeric, String, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from app.core.enums import ApprovalStatus, ExecutionState, ExpiryPhase
 from app.core.ids import utcnow
 from app.db.database import Base
+
+
+def _text(value) -> str:
+    """Columns hold plain text, but a value just assigned may still be the enum member."""
+    return value.value if hasattr(value, "value") else str(value or "")
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 class Approval(Base):
@@ -58,6 +72,79 @@ class Approval(Base):
         cascade="all, delete-orphan",
     )
 
+    # What the approval is now. status, execution_state and expired_phase are written only by
+    # ApprovalLifecycle.move; everything else reads them through these.
+
+    @property
+    def state(self) -> ApprovalStatus:
+        return ApprovalStatus(_text(self.status) or ApprovalStatus.PENDING.value)
+
+    @property
+    def execution(self) -> ExecutionState:
+        return ExecutionState(_text(self.execution_state) or ExecutionState.NONE.value)
+
+    @property
+    def is_pending(self) -> bool:
+        return self.state is ApprovalStatus.PENDING
+
+    @property
+    def is_expired(self) -> bool:
+        return self.state is ApprovalStatus.EXPIRED
+
+    @property
+    def awaits_resubmit(self) -> bool:
+        """Approved, and the agent has not sent the call again yet."""
+        return self.state is ApprovalStatus.APPROVED and self.execution is ExecutionState.NONE
+
+    @property
+    def execution_started(self) -> bool:
+        return self.execution is not ExecutionState.NONE
+
+    def due_phase(self, now: datetime) -> ExpiryPhase | None:
+        """The deadline that has passed, if one has. Nothing expires once its call has started."""
+        if self.is_pending:
+            deadline, phase = _as_utc(self.expires_at), ExpiryPhase.PENDING
+        elif self.awaits_resubmit:
+            deadline, phase = _as_utc(self.resubmit_expires_at), ExpiryPhase.RESUBMIT
+        else:
+            return None
+        return phase if deadline is not None and deadline <= now else None
+
+    # Who has to approve.
+
+    @property
+    def votes_needed(self) -> int:
+        return int(self.required_count or 1)
+
+    @property
+    def requirements(self) -> list[dict]:
+        """The groups that must approve, each with how many of its members. Empty: anyone eligible."""
+        raw = self.group_requirements if isinstance(self.group_requirements, list) else []
+        found = [
+            {"group_id": str(item["group_id"]), "required_count": int(item.get("required_count") or 1)}
+            for item in raw
+            if isinstance(item, dict) and item.get("group_id")
+        ]
+        if found:
+            return found
+        if self.group_id:
+            return [{"group_id": self.group_id, "required_count": self.votes_needed}]
+        return []
+
+    # Whether it was asked under rules that are still in force.
+
+    def policy_changed(self, policy_id: str | None, policy_version: int | None) -> bool:
+        if self.policy_version is None:
+            return False
+        if policy_version != self.policy_version:
+            return True
+        return bool(self.policy_id and policy_id and policy_id != self.policy_id)
+
+    def approval_policy_changed(self, policy: ApprovalPolicy | None) -> bool:
+        if policy is None or not policy.is_active:
+            return True
+        return (policy.version or 1) != (self.approval_policy_version or 1)
+
 
 class ApprovalPolicy(Base):
     __tablename__ = "approval_policies"
@@ -87,6 +174,10 @@ class ApprovalPolicy(Base):
         cascade="all, delete-orphan",
         order_by="ApprovalRequirement.position",
     )
+
+    @property
+    def is_active(self) -> bool:
+        return _text(self.status) == "active"
 
 
 class ApprovalRequirement(Base):

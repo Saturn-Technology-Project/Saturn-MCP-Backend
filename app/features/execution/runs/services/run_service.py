@@ -442,8 +442,7 @@ def _requested_amount(arguments: dict) -> Decimal | None:
 
 def pending_approval_id(run: Run) -> str | None:
     for approval in run.approvals:
-        status = approval.status.value if hasattr(approval.status, "value") else approval.status
-        if status == ApprovalStatus.PENDING.value:
+        if approval.is_pending:
             return approval.id
     return None
 

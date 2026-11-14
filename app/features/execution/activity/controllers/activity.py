@@ -128,6 +128,11 @@ CHANGE_EVENTS = (
     AuditEvent.TOOL_SET_ASSIGNED.value,
     AuditEvent.MEMBER_INVITED.value,
     AuditEvent.MEMBER_UPDATED.value,
+    # What the platform did inside this organization. The tenant must be able to see it:
+    # a member the platform creates as an admin can approve keys and read content.
+    AuditEvent.MEMBER_CREATED.value,
+    AuditEvent.MEMBER_PASSWORD_RESET.value,
+    AuditEvent.ORG_UPDATED.value,
     AuditEvent.INVITE_REVOKED.value,
     AuditEvent.AGENT_DELETED.value,
     AuditEvent.MCP_SERVER_DELETED.value,

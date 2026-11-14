@@ -131,3 +131,34 @@ async def test_admin_can_change_member_access(client):
     assert body["title"] == "Support"
     assert body["permissions"]["approvals"] == "write"
     assert "agent_customer_ops" in body["agent_ids"]
+
+
+async def test_a_member_without_agent_access_is_not_sent_agents_through_the_summaries(client):
+    """GET /agents refuses them, so GET /org and GET /auth/me must not hand the same list over."""
+    invited = await client.post(
+        "/org/invites",
+        json={
+            "email": "approver@saturn.ai",
+            "name": "Approver",
+            "role": "custom",
+            "permissions": {"agents": "none", "policies": "none", "approvals": "write", "team": "none"},
+        },
+    )
+    assert invited.status_code == 201, invited.text
+    accepted = await client.post("/auth/accept-invite", json={"token": invited.json()["token"], "password": "password1"})
+    assert accepted.status_code == 200, accepted.text
+    headers = {"Authorization": f"Bearer {accepted.json()['token']}"}
+
+    assert (await client.get("/agents", headers=headers)).status_code == 403
+    for body in (
+        accepted.json()["user"],
+        (await client.get("/auth/me", headers=headers)).json(),
+        (await client.get("/org", headers=headers)).json(),
+    ):
+        assert body["agents"] == [] and body["mcp_servers"] == []
+        assert body.get("tool_sets", []) == [] and body["users"] == []
+
+    # Someone who may read agents still gets them.
+    mine = (await client.get("/org")).json()
+    assert mine["agents"] and mine["mcp_servers"]
+    assert (await client.get("/auth/me")).json()["agents"]
